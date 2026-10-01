@@ -2181,6 +2181,12 @@ inline void releaseSdRail() {
     pinMode(ACTIVE.sd.cs, OUTPUT);
     digitalWrite(ACTIVE.sd.cs, HIGH);
   }
+  // Same holds on SCLK/MOSI when the card stays powered (see
+  // PowerManager::powerDownRailsForSleep). Release before any SPI remapping.
+  if (ACTIVE.sd.powerEnable < 0) {
+    if (ACTIVE.sd.sclk >= 0) gpio_hold_dis(static_cast<gpio_num_t>(ACTIVE.sd.sclk));
+    if (ACTIVE.sd.mosi >= 0) gpio_hold_dis(static_cast<gpio_num_t>(ACTIVE.sd.mosi));
+  }
 }
 inline bool hasMic() { return ACTIVE.mic.input != MicInput::None; }
 inline bool hasBuzzer() { return ACTIVE.audio.buzzer != PIN_UNASSIGNED; }

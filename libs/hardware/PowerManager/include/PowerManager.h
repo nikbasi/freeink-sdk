@@ -88,6 +88,9 @@ class PowerManager {
   //     scanning costs several mA, dwarfing every other sleep load.
   //   * SD — chip-select is held DEASSERTED so a still-powered card idles
   //     deselected instead of floating into an undefined selection state.
+  //     On those same ungated boards, SCLK and MOSI are held at SPI mode-0
+  //     idle (LOW) so a floating clock cannot tick the card while it still
+  //     has VDD. MISO is left alone (card-driven when selected).
   // Every one of these holds is released again by the corresponding bring-up
   // path (InputManager's touch reset, SDCardManager::begin(),
   // BoardConfig::releaseSdRail()) — gpio_hold_en survives the wake reset, and a

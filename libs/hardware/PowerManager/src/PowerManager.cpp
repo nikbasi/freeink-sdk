@@ -176,11 +176,19 @@ void PowerManager::powerDownRailsForSleep() {
   // With no rail to cut, the card stays powered through sleep, and
   // esp_sleep_config_gpio_isolate() would leave its chip-select floating — an
   // undefined selection state for a card that is still listening. Hold CS
-  // DEASSERTED (HIGH) instead, so it idles deselected. Skipped where the rail
-  // IS cut, for the same reason RESET is not held HIGH there: driving an input
-  // of an unpowered chip can back-power it through its protection diode.
-  // SDCardManager::begin() and BoardConfig::releaseSdRail() drop the hold.
-  if (b.sd.powerEnable < 0) holdRailOff(b.sd.cs, HIGH);
+  // DEASSERTED (HIGH) instead, so it idles deselected. Also hold CLK and MOSI
+  // at SPI mode-0 idle (LOW): with the card still on VDD, floating clock/data
+  // lines can clock spurious edges into a powered card. MISO stays an input —
+  // driving it would fight the card's release and risk back-power. Skipped
+  // where the rail IS cut, for the same reason RESET is not held HIGH there:
+  // driving an input of an unpowered chip can back-power it through its
+  // protection diode. SDCardManager::begin() and BoardConfig::releaseSdRail()
+  // drop the holds.
+  if (b.sd.powerEnable < 0) {
+    holdRailOff(b.sd.cs, HIGH);
+    holdRailOff(b.sd.sclk, LOW);
+    holdRailOff(b.sd.mosi, LOW);
+  }
   holdRailOff(b.touch.powerEnable, b.touch.powerEnableActiveHigh ? LOW : HIGH);
   // Boards with no touch rail have nothing to cut, so the digitizer would keep
   // scanning all through deep sleep — a GT911 costs several mA there, which on

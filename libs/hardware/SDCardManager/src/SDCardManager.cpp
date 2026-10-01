@@ -164,11 +164,15 @@ bool SDCardManager::begin() {
     digitalWrite(BoardConfig::ACTIVE.display.cs, HIGH);
   }
 
-  // The sleep path latches CS deasserted on boards with no SD rail, and the hold
-  // survives the deep-sleep wake reset. Release it before SdFat claims the pin,
-  // or CS is stuck HIGH and the card is never selected — mount fails on every
+  // The sleep path latches CS (and on ungated boards SCLK/MOSI) for deep sleep;
+  // those holds survive the wake reset. Release them before SdFat / SPI.begin
+  // remaps the pins, or the bus stays stuck and the card never mounts on any
   // boot that follows a sleep.
   gpio_hold_dis(static_cast<gpio_num_t>(SD_CS));
+  if (BoardConfig::ACTIVE.sd.powerEnable < 0) {
+    if (SD_SCLK >= 0) gpio_hold_dis(static_cast<gpio_num_t>(SD_SCLK));
+    if (SD_MOSI >= 0) gpio_hold_dis(static_cast<gpio_num_t>(SD_MOSI));
+  }
 
   // A board with a dedicated SD SPI bus (separateSpi) MUST NOT reconfigure the
   // global SPI object: that bus belongs to the display, and Arduino's second
