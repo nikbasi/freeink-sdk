@@ -455,6 +455,10 @@ BatteryMonitor::Status BatteryMonitor::readStatus() const {
     }
     status.chargingKnown = chargingKnown;
     status.charging = charging;
+    bool externalKnown = false;
+    const bool external = readChargerExternalPower(externalKnown);
+    status.externalPowerKnown = externalKnown;
+    status.externalPower = external;
     return status;
   }
 #endif
@@ -616,6 +620,35 @@ bool BatteryMonitor::readM5Pm1Status(Status& status) const {
   status.chargingKnown = status.externalPowerKnown;
   status.charging = status.externalPower;
   return status.percentageKnown || status.millivoltsKnown || status.externalPowerKnown;
+}
+
+bool BatteryMonitor::clearChargerInputHiZ() {
+#if FREEINK_BATTERY_I2C_GAUGE
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.chargerAddr == 0) return false;
+  uint8_t reg00 = 0;
+  if (!readReg8(g.chargerAddr, 0x00, reg00)) return false;
+  if ((reg00 & 0x80) == 0) return true;  // already allowing input
+  const uint8_t cleared = static_cast<uint8_t>(reg00 & 0x7F);
+  if (!writeReg8(g.chargerAddr, 0x00, cleared)) return false;
+  uint8_t verify = 0;
+  if (!readReg8(g.chargerAddr, 0x00, verify)) return false;
+  return (verify & 0x80) == 0;
+#else
+  return false;
+#endif
+}
+
+bool BatteryMonitor::readChargerDiag(uint8_t& reg00, uint8_t& reg0b) const {
+#if FREEINK_BATTERY_I2C_GAUGE
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.chargerAddr == 0) return false;
+  return readReg8(g.chargerAddr, 0x00, reg00) && readReg8(g.chargerAddr, 0x0B, reg0b);
+#else
+  (void)reg00;
+  (void)reg0b;
+  return false;
+#endif
 }
 
 // Standard 1S Li-ion / LiPo (4.20 V) rest-voltage discharge curve, one entry per

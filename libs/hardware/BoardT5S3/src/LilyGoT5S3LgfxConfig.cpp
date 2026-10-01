@@ -283,6 +283,9 @@ freeink::LgfxEpdConfig buildConfig() {
       grayDark,
       grayLight,
       true,  // grey columns live in the fast bank above
+      // Clean bank skips already-white pixels after another clean push; force a
+      // cheap normalize so HALF/FULL actually scrub the whole glass (ghosts).
+      true,  // cleanBankNeedsFreshBackground
   };
 }
 

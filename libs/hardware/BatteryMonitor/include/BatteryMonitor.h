@@ -86,6 +86,13 @@ public:
     // never had a way to see it.
     bool isExternalPowerPresent(bool* known = nullptr) const;
 
+    // Clear BQ25896 EN_HIZ so USB input can charge again (e.g. after a power
+    // profile left the charger in high-Z). No-op / false when no charger IC.
+    bool clearChargerInputHiZ();
+
+    // Raw BQ25896 REG00 / REG0B for diagnostics. False when no charger / I2C fail.
+    bool readChargerDiag(uint8_t& reg00, uint8_t& reg0b) const;
+
     // Percentage from a millivolt value, off a standard 1S Li-ion discharge
     // curve. The result is always a multiple of 10: voltage cannot resolve a
     // Li-ion pack any finer than that, and pretending otherwise just produces a
