@@ -229,6 +229,11 @@ class InputManager {
   // drain and route them afterwards. Returns false when no tap is pending.
   bool popTouchTap(float& nx, float& ny);
 
+  // Pop the next stationary long-press at its touch-down position. The async
+  // task suppresses the rest of that contact before queueing, so release cannot
+  // also appear as a tap.
+  bool popTouchLongPress(float& nx, float& ny);
+
   // Pop the next latched swipe gesture (normalized 0..1 panel-native start/end
   // coordinates, same frame as wasSwipe). Like taps, async polling queues
   // swipes so gestures that complete during e-paper refreshes are not lost.
@@ -275,6 +280,7 @@ class InputManager {
 
   QueueHandle_t _asyncQueue = nullptr;
   QueueHandle_t _asyncTapQueue = nullptr;
+  QueueHandle_t _asyncLongPressQueue = nullptr;
   QueueHandle_t _asyncSwipeQueue = nullptr;
   struct QueuedMultiTouchSwipe {
     uint16_t startX;

@@ -226,6 +226,7 @@ void InputManager::beginAsync(const uint8_t taskPriority, const uint32_t pollMs,
   _asyncQueue = xQueueCreate(queueLen, sizeof(uint8_t));
   if (!_asyncQueue) return;
   _asyncTapQueue = xQueueCreate(queueLen, sizeof(float) * 2);
+  _asyncLongPressQueue = xQueueCreate(queueLen, sizeof(float) * 2);
   _asyncSwipeQueue = xQueueCreate(queueLen, sizeof(float) * 4);
   _asyncMultiTouchSwipeQueue = xQueueCreate(queueLen, sizeof(QueuedMultiTouchSwipe));
   _asyncMultiTouchRotationQueue = xQueueCreate(queueLen, sizeof(QueuedMultiTouchRotation));
@@ -241,6 +242,11 @@ void InputManager::asyncPoll() {
     update();
     for (const uint8_t b : kButtons) {
       if (wasPressed(b)) xQueueSend(_asyncQueue, &b, 0);
+    }
+    float longPress[2];
+    if (_asyncLongPressQueue && wasTouchLongPress(longPress[0], longPress[1])) {
+      suppressTouchContact();
+      xQueueSend(_asyncLongPressQueue, longPress, 0);
     }
     float tap[2];
     if (_asyncTapQueue && wasTouchTap(tap[0], tap[1])) {
@@ -281,6 +287,15 @@ bool InputManager::popTouchTap(float& nx, float& ny) {
   if (xQueueReceive(_asyncTapQueue, tap, 0) != pdTRUE) return false;
   nx = tap[0];
   ny = tap[1];
+  return true;
+}
+
+bool InputManager::popTouchLongPress(float& nx, float& ny) {
+  if (!_asyncLongPressQueue) return false;
+  float longPress[2];
+  if (xQueueReceive(_asyncLongPressQueue, longPress, 0) != pdTRUE) return false;
+  nx = longPress[0];
+  ny = longPress[1];
   return true;
 }
 
