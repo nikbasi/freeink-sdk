@@ -2,6 +2,7 @@
 
 #include <BoardConfig.h>
 
+#include <algorithm>
 #include <cstring>
 
 #if FREEINK_DRIVER_LGFX_EPD
@@ -118,11 +119,6 @@ bool g_cleanBankNeedsFreshBackground = false;
 // pays for the fallback in normalizeForCleanBank(). Set in begin().
 bool g_noDriveBankAvailable = false;
 
-// Whether the refresh this driver queued last went out through the clean bank.
-// g_lastBaseEpdMode is that history already, so this reads it rather than keeping
-// a second flag that could disagree with it.
-bool lastPushUsedCleanBank();
-
 // Which LovyanGFX bank each of our three refresh modes goes out under.
 //
 // Half and Full both take the clean bank, and neither is ever downgraded: they
@@ -177,6 +173,24 @@ void fillCanvasBW(const uint8_t* fb) {
     for (uint16_t bx = 0; bx < g_wb; ++bx) {
       const uint8_t b = src[bx];
       for (uint8_t bit = 0; bit < 8; ++bit) drow[bx * 8 + bit] = (b & (0x80 >> bit)) ? kGrayWhite : kGrayBlack;
+    }
+  }
+}
+
+// Expand only a native-panel rectangle. The retained canvas already contains
+// the rest of the last submitted frame, so a clipped sprite push can avoid
+// touching unrelated Panel_EPD pixels.
+void fillCanvasBWWindow(const uint8_t* fb, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  if (!g_canvas || !fb || w == 0 || h == 0) return;
+  auto* dst = static_cast<uint8_t*>(g_canvas->getBuffer());
+  if (!dst) return;
+  const uint16_t xEnd = static_cast<uint16_t>(x + w);
+  const uint16_t yEnd = static_cast<uint16_t>(y + h);
+  for (uint16_t py = y; py < yEnd; ++py) {
+    const uint8_t* src = fb + static_cast<uint32_t>(py) * g_wb;
+    uint8_t* drow = dst + static_cast<uint32_t>(py) * g_w;
+    for (uint16_t px = x; px < xEnd; ++px) {
+      drow[px] = (src[px >> 3] & (0x80u >> (px & 7))) ? kGrayWhite : kGrayBlack;
     }
   }
 }
@@ -246,13 +260,30 @@ void settleDisplay() {
   vTaskDelay(pdMS_TO_TICKS(2));
   g_dev.waitDisplay();
 }
-bool lastPushUsedCleanBank() { return g_lastBaseEpdMode == lgfx::epd_mode::epd_text; }
-
 void pushCanvas(lgfx::epd_mode::epd_mode_t epdMode) {
   if (!g_canvas) return;
   g_dev.waitDisplay();
   g_dev.setEpdMode(epdMode);
-  g_canvas->pushSprite(0, 0);  // commits to the panel; Panel_EPD runs the refresh
+  g_dev.setAutoDisplay(false);
+  g_canvas->pushSprite(0, 0);
+  g_dev.setAutoDisplay(true);
+  g_dev.display(0, 0, g_w, g_h);
+  settleDisplay();
+}
+
+void pushCanvasWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  if (!g_canvas || w == 0 || h == 0) return;
+  g_dev.waitDisplay();
+  // Write through a graded mode so an even-alignment fringe keeps any retained
+  // gray value. Refresh through FAST afterward to avoid the eraser flash.
+  g_dev.setEpdMode(lgfx::epd_mode::epd_quality);
+  g_dev.setAutoDisplay(false);
+  g_dev.setClipRect(x, y, w, h);
+  g_canvas->pushSprite(0, 0);
+  g_dev.clearClipRect();
+  g_dev.setAutoDisplay(true);
+  g_dev.setEpdMode(lgfx::epd_mode::epd_fast);
+  g_dev.display(x, y, w, h);
   settleDisplay();
 }
 
@@ -279,7 +310,7 @@ void pushCanvasGraded(lgfx::epd_mode::epd_mode_t refreshMode) {
   g_canvas->pushSprite(0, 0);  // writes the panel buffer, queues no refresh
   g_dev.setAutoDisplay(true);
   g_dev.setEpdMode(refreshMode);
-  g_dev.display();  // covers the rect pushSprite accumulated
+  g_dev.display(0, 0, g_w, g_h);
   settleDisplay();
 }
 
@@ -313,15 +344,15 @@ void pushCanvasGraded(lgfx::epd_mode::epd_mode_t refreshMode) {
 // Either way this writes the panel's own buffer and not the canvas, so the frame
 // the caller is about to push survives untouched.
 void normalizeForCleanBank() {
-  if (!g_cleanBankNeedsFreshBackground || !lastPushUsedCleanBank()) return;
+  if (!g_cleanBankNeedsFreshBackground) return;
   const auto bank = g_noDriveBankAvailable ? lgfx::epd_mode::epd_fastest : lgfx::epd_mode::epd_fast;
   g_dev.waitDisplay();
   g_dev.setEpdMode(bank);
   g_dev.setAutoDisplay(false);
   g_dev.fillScreen(g_dev.color888(255, 255, 255));
   g_dev.setAutoDisplay(true);
-  g_dev.display();  // covers the rect fillScreen accumulated
-  g_dev.waitDisplay();
+  g_dev.display(0, 0, g_w, g_h);
+  settleDisplay();
   g_lastBaseEpdMode = bank;
 }
 
@@ -370,6 +401,53 @@ void LgfxEpdDriver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev,
 #endif
 }
 
+void LgfxEpdDriver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y,
+                                  uint16_t w, uint16_t h, bool turnOff) {
+  (void)bus;
+  (void)prev;
+#if FREEINK_DRIVER_LGFX_EPD
+  if (!fb || w == 0 || h == 0 || x >= g_w || y >= g_h) return;
+  if (w > g_w - x) w = static_cast<uint16_t>(g_w - x);
+  if (h > g_h - y) h = static_cast<uint16_t>(g_h - y);
+
+  // Panel_EPD stores two pixels per byte and rounds its refresh range to an
+  // even native X boundary. Match that here so the retained canvas and panel
+  // request cover exactly the same pixels.
+  const uint16_t requestedX = x;
+  const uint16_t requestedW = w;
+  const uint16_t alignedX = static_cast<uint16_t>(x & ~1u);
+  const uint16_t right = static_cast<uint16_t>(x + w);
+  const uint16_t alignedRight = static_cast<uint16_t>(std::min<uint32_t>(g_w, (right + 1u) & ~1u));
+  x = alignedX;
+  w = static_cast<uint16_t>(alignedRight - alignedX);
+  if (w == 0) return;
+
+  // For near-full updates the contiguous full-frame expansion and sprite push
+  // are cheaper than clipping a giant region.
+  const uint32_t area = static_cast<uint32_t>(w) * h;
+  const uint32_t fullArea = static_cast<uint32_t>(g_w) * g_h;
+  if (area * 4u >= fullArea * 3u) {
+    display(bus, fb, prev, RefreshMode::Fast, turnOff);
+    return;
+  }
+
+  // Expand only the caller's pixels. Alignment fringe pixels keep their
+  // retained canvas value (which may be gray) while the panel refreshes the
+  // containing two-pixel pair.
+  fillCanvasBWWindow(fb, requestedX, y, requestedW, h);
+  g_lastBaseEpdMode = lgfx::epd_mode::epd_fast;
+  pushCanvasWindow(x, y, w, h);
+  if (turnOff) g_dev.sleep();
+#else
+  (void)fb;
+  (void)x;
+  (void)y;
+  (void)w;
+  (void)h;
+  (void)turnOff;
+#endif
+}
+
 // One render, one push: the whole page -- text and its anti-aliasing greys --
 // reaches the panel as a single waveform.
 //
@@ -396,7 +474,9 @@ void LgfxEpdDriver::displayGrayFrame(EpdBus& bus, const uint8_t* fb, RefreshMode
   // exactly, so the periodic scrub page carries its greys too. FAST takes the
   // differential bank. Either way the write itself must be graded -- a fast-mode
   // write Bayer-dithers the greys to the rails before any LUT is consulted.
-  g_lastBaseEpdMode = epdModeFor(mode);
+  const auto epdMode = epdModeFor(mode);
+  if (epdMode == lgfx::epd_mode::epd_text) normalizeForCleanBank();
+  g_lastBaseEpdMode = epdMode;
   pushCanvasGraded(g_lastBaseEpdMode);
   if (turnOff) g_dev.sleep();
 #else
