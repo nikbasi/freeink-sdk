@@ -157,6 +157,9 @@ public:
       themed.trailingStyles = plainStyles(Paint::solid(Color::Black));
     if (textStyleUnset(themed.trailingText))
       themed.trailingText = theme_.bodyText;
+    if ((themed.status.showBattery || themed.status.clockText) &&
+        textStyleUnset(themed.status.battery.text))
+      themed.status.battery.text = theme_.smallText;
     if (themed.sidePadding < 0)
       themed.sidePadding = theme_.headerSidePadding;
     // Divider: the theme's headerUnderline sets the rule thickness when the
@@ -316,6 +319,8 @@ public:
     }
     if (themed.rowRadius == 0)
       themed.rowRadius = theme_.listRowRadius;
+    if (themed.separatorPaint.kind == PaintKind::None)
+      themed.separatorPaint = theme_.listSeparator;
     if (themed.sidePadding < 0)
       themed.sidePadding = theme_.listSidePadding;
     if (themed.scrollIndicatorWidth < 0)
@@ -501,14 +506,14 @@ public:
     const auto &layout = builtinKeyboardLayout(props.layout, props.shifted, props.symbols,
                                                 props.numberRow, props.langKey);
     ui::qwertyKeyboard(frame_, takeKeyboard(anchor, height, layout.rowCount, props.padding,
-                                           props.rowGap, props.minTouchSize), props);
+                                           props.rowGap, props.gap, props.minTouchSize), props);
   }
 
   void keyboard(const KeyboardProps &props, int16_t height = 0,
                 LayoutAnchor anchor = LayoutAnchor::Top) {
     if (!props.layout) return;
     ui::keyboard(frame_, takeKeyboard(anchor, height, props.layout->rowCount, props.padding,
-                                     props.rowGap, props.minTouchSize), props);
+                                     props.rowGap, props.gap, props.minTouchSize), props);
   }
 
   void bookCard(const BookCardProps &props, int16_t height = 0,
@@ -706,16 +711,13 @@ public:
 
 private:
   Rect takeKeyboard(LayoutAnchor anchor, int16_t height, uint8_t rows,
-                    Insets padding, int16_t rowGap, int16_t minTouchSize) {
+                    Insets padding, int16_t rowGap, int16_t keyGap, int16_t minTouchSize) {
     const Rect safe = frame_.safeRect();
     if (height <= 0) {
-      const int16_t minRow = minTouchSize > 64 ? minTouchSize : 64;
-      height = keyboardPreferredHeight(safe.width, rows, padding, rowGap, minRow);
-      // Keep the existing key heights when increasing the vertical separation.
-      // The half-screen budget includes a baseline 2px gap; add only the extra
-      // row spacing, leaving the entry field above the keyboard.
-      const int16_t extraGap = rowGap > 2 ? rowGap - 2 : 0;
-      const int16_t maxHeight = static_cast<int16_t>(safe.height / 2 + extraGap * (rows > 0 ? rows - 1 : 0));
+      height = keyboardPreferredHeight(safe.width, rows, padding, rowGap, minTouchSize, keyGap);
+      // Leave space for the entry field even on short screens. A five-row
+      // keyboard at the normal 56px height still fits on a 480px display.
+      const int16_t maxHeight = static_cast<int16_t>(static_cast<int32_t>(safe.height) * 2 / 3);
       if (height > maxHeight) height = maxHeight;
     }
     Rect rect = take(anchor, height);
@@ -945,6 +947,11 @@ public:
   // True while a held touch sits on an interactive element (the routing marks
   // it active and it renders with its StateActive style).
   bool touchActive() const { return interactions_.activeIndex() >= 0; }
+
+  bool hitPublished(int16_t x, int16_t y, ActionId action,
+                    Interaction &out) const {
+    return interactions_.hitPublished(x, y, action, out);
+  }
 
   // Drop a pending tap flash. Call from handlers that navigate to a different
   // screen: the tapped element no longer exists there, and an element on the

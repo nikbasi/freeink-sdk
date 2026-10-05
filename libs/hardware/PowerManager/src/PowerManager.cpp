@@ -22,6 +22,9 @@ PowerManager::SleepParkHook s_parkHook = nullptr;
 uint32_t s_debugTimerWakeSeconds = 0;
 bool s_debugSimulateHeld = false;
 
+// Consumed by armPowerButtonWakeup(); see setExtraWakePins().
+uint64_t s_extraWakeMask = 0;
+
 // Sleep-entry telemetry. RTC_NOINIT rather than plain statics because every
 // interesting value here is produced on the way INTO sleep, after the SD card is
 // unmounted and the console is down — the next boot is the only reader it will
@@ -94,6 +97,15 @@ void PowerManager::armWakeOnPins(uint64_t gpioMask, bool wakeLow) {
 #endif
 }
 
+void PowerManager::setExtraWakePins(const uint64_t gpioMask) {
+  s_extraWakeMask = 0;
+  for (int pin = 0; pin < 64; ++pin) {
+    if ((gpioMask & (1ULL << pin)) == 0) continue;
+    if (!esp_sleep_is_valid_wakeup_gpio(static_cast<gpio_num_t>(pin))) continue;
+    s_extraWakeMask |= 1ULL << pin;
+  }
+}
+
 bool PowerManager::armPowerButtonWakeup() {
   const int8_t pin = powerPin();
   if (pin < 0) return false;
@@ -101,7 +113,16 @@ bool PowerManager::armPowerButtonWakeup() {
 
   // Hold the idle level with the opposite pull so the line is defined in sleep.
   pinMode(pin, activeHigh ? INPUT_PULLDOWN : INPUT_PULLUP);
-  armWakeOnPins(1ULL << pin, /*wakeLow=*/!activeHigh);
+  uint64_t mask = 1ULL << pin;
+  // The extras are active-low keys: they can only share an any-low trigger.
+  if (!activeHigh) {
+    for (int extra = 0; extra < 64; ++extra) {
+      if ((s_extraWakeMask & (1ULL << extra)) == 0) continue;
+      pinMode(extra, INPUT_PULLUP);
+      mask |= 1ULL << extra;
+    }
+  }
+  armWakeOnPins(mask, /*wakeLow=*/!activeHigh);
   return true;
 }
 
@@ -155,6 +176,13 @@ void holdRailOff(int8_t pin, uint8_t offLevel) {
 
 void PowerManager::powerDownRailsForSleep() {
   const auto& b = BoardConfig::ACTIVE;
+#if FREEINK_DEVICE_METALIO_EINK4
+  if (BoardConfig::isMetalioEInk4()) {
+    metalio::setAmplifier(false);
+    digitalWrite(metalio::VIBRATION_GPIO, LOW);
+    // Keep the shared display/SD rail up, as required by the vendor shutdown.
+  }
+#endif
 #if FREEINK_DEVICE_WS397
   // The EPD rail is an AXP2101 LDO, not a GPIO, so holdRailOff() below cannot
   // reach it — drop it here or the panel stays powered all through deep sleep.
