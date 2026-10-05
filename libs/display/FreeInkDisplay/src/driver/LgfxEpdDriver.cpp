@@ -260,9 +260,35 @@ void settleDisplay() {
   vTaskDelay(pdMS_TO_TICKS(2));
   g_dev.waitDisplay();
 }
+
+// A queued refresh is not busy until the panel task has taken the job. Trust
+// displayBusy() only after this short ingest window, or the next push can
+// start against a waveform that has not raised the flag yet.
+bool gWindowQueued = false;
+uint32_t gWindowIngestUntil = 0;
+
+void markWindowQueued() {
+  gWindowQueued = true;
+  gWindowIngestUntil = millis() + 4;
+}
+
+bool lgfxPanelReady() {
+  if (gWindowQueued && static_cast<int32_t>(millis() - gWindowIngestUntil) < 0) return false;
+  if (g_dev.displayBusy()) return false;
+  gWindowQueued = false;
+  return true;
+}
+
+// Blocking callers must not push until a queued refresh has both been ingested
+// and finished. waitDisplay() alone can return in the gap before the panel
+// task raises its busy flag.
+void waitPanelIdle() {
+  while (!lgfxPanelReady()) vTaskDelay(1);
+  g_dev.waitDisplay();
+}
 void pushCanvas(lgfx::epd_mode::epd_mode_t epdMode) {
   if (!g_canvas) return;
-  g_dev.waitDisplay();
+  waitPanelIdle();
   g_dev.setEpdMode(epdMode);
   g_dev.setAutoDisplay(false);
   g_canvas->pushSprite(0, 0);
@@ -271,20 +297,29 @@ void pushCanvas(lgfx::epd_mode::epd_mode_t epdMode) {
   settleDisplay();
 }
 
-void pushCanvasWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+void pushCanvasWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, lgfx::epd_mode::epd_mode_t refreshMode,
+                      bool wait) {
   if (!g_canvas || w == 0 || h == 0) return;
-  g_dev.waitDisplay();
+  // Deferred callers already observed an idle panel and must not wait here.
+  if (wait) waitPanelIdle();
   // Write through a graded mode so an even-alignment fringe keeps any retained
-  // gray value. Refresh through FAST afterward to avoid the eraser flash.
+  // gray value. The refresh bank is separate: fast while the finger is moving,
+  // clean once it has stopped.
   g_dev.setEpdMode(lgfx::epd_mode::epd_quality);
   g_dev.setAutoDisplay(false);
   g_dev.setClipRect(x, y, w, h);
   g_canvas->pushSprite(0, 0);
   g_dev.clearClipRect();
   g_dev.setAutoDisplay(true);
-  g_dev.setEpdMode(lgfx::epd_mode::epd_fast);
+  g_dev.setEpdMode(refreshMode);
+  g_lastBaseEpdMode = refreshMode;
   g_dev.display(x, y, w, h);
-  settleDisplay();
+  if (wait) {
+    settleDisplay();
+    gWindowQueued = false;
+  } else {
+    markWindowQueued();
+  }
 }
 
 // Push the canvas keeping its grey levels, then refresh through the differential
@@ -304,7 +339,7 @@ void pushCanvasWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
 // skips everything that did not change).
 void pushCanvasGraded(lgfx::epd_mode::epd_mode_t refreshMode) {
   if (!g_canvas) return;
-  g_dev.waitDisplay();
+  waitPanelIdle();
   g_dev.setEpdMode(lgfx::epd_mode::epd_quality);
   g_dev.setAutoDisplay(false);
   g_canvas->pushSprite(0, 0);  // writes the panel buffer, queues no refresh
@@ -346,7 +381,7 @@ void pushCanvasGraded(lgfx::epd_mode::epd_mode_t refreshMode) {
 void normalizeForCleanBank() {
   if (!g_cleanBankNeedsFreshBackground) return;
   const auto bank = g_noDriveBankAvailable ? lgfx::epd_mode::epd_fastest : lgfx::epd_mode::epd_fast;
-  g_dev.waitDisplay();
+  waitPanelIdle();
   g_dev.setEpdMode(bank);
   g_dev.setAutoDisplay(false);
   g_dev.fillScreen(g_dev.color888(255, 255, 255));
@@ -435,8 +470,7 @@ void LgfxEpdDriver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t*
   // retained canvas value (which may be gray) while the panel refreshes the
   // containing two-pixel pair.
   fillCanvasBWWindow(fb, requestedX, y, requestedW, h);
-  g_lastBaseEpdMode = lgfx::epd_mode::epd_fast;
-  pushCanvasWindow(x, y, w, h);
+  pushCanvasWindow(x, y, w, h, lgfx::epd_mode::epd_fast, true);
   if (turnOff) g_dev.sleep();
 #else
   (void)fb;
@@ -445,6 +479,52 @@ void LgfxEpdDriver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t*
   (void)w;
   (void)h;
   (void)turnOff;
+#endif
+}
+
+bool LgfxEpdDriver::refreshInProgress() const {
+#if FREEINK_DRIVER_LGFX_EPD
+  return !lgfxPanelReady();
+#else
+  return false;
+#endif
+}
+
+bool LgfxEpdDriver::displayWindowDeferred(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x,
+                                          uint16_t y, uint16_t w, uint16_t h, RefreshMode mode) {
+  (void)bus;
+  (void)prev;
+#if FREEINK_DRIVER_LGFX_EPD
+  // The 1-bit frame can change while a waveform runs. The panel canvas cannot:
+  // pushing into a copy that is still in flight tears the LUT and freezes the
+  // next wait. Leave the latest frame queued until the panel is idle.
+  if (!fb || !lgfxPanelReady()) return false;
+  if (w == 0 || h == 0 || x >= g_w || y >= g_h) return true;
+  if (w > g_w - x) w = static_cast<uint16_t>(g_w - x);
+  if (h > g_h - y) h = static_cast<uint16_t>(g_h - y);
+
+  const uint16_t requestedX = x;
+  const uint16_t requestedW = w;
+  const uint16_t alignedX = static_cast<uint16_t>(x & ~1u);
+  const uint16_t right = static_cast<uint16_t>(x + w);
+  const uint16_t alignedRight = static_cast<uint16_t>(std::min<uint32_t>(g_w, (right + 1u) & ~1u));
+  x = alignedX;
+  w = static_cast<uint16_t>(alignedRight - alignedX);
+  if (w == 0) return true;
+
+  // Stay on the window even when it is tall. Promoting it to a full refresh
+  // would block the touch loop, which is the wait this path exists to avoid.
+  fillCanvasBWWindow(fb, requestedX, y, requestedW, h);
+  pushCanvasWindow(x, y, w, h, epdModeFor(mode), false);
+  return true;
+#else
+  (void)fb;
+  (void)x;
+  (void)y;
+  (void)w;
+  (void)h;
+  (void)mode;
+  return false;
 #endif
 }
 

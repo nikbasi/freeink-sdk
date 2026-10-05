@@ -265,6 +265,10 @@ class FreeInkDisplay {
 
   // EXPERIMENTAL: Windowed update - display only a rectangular region
   void displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen = false);
+  // Queue a window refresh and return while the waveform runs. False when the
+  // panel is still busy; the framebuffer may be redrawn and the call retried.
+  bool displayWindowDeferred(uint16_t x, uint16_t y, uint16_t w, uint16_t h, RefreshMode mode = FAST_REFRESH);
+  bool windowRefreshBusy() const;
   void displayGrayBuffer(bool turnOffScreen = false, const unsigned char* lut = nullptr, bool factoryMode = false);
   // Single-push grayscale: composes the framebuffer (B/W) with the staged
   // LSB/MSB planes and displays them as one waveform. Falls back to a plain

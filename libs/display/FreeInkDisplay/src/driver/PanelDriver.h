@@ -56,6 +56,19 @@ class PanelDriver {
     display(bus, fb, prev, RefreshMode::Fast, turnOff);
   }
 
+  // True while a refresh this driver queued is still running. The default
+  // drivers finish inside display(), so they are never busy afterward.
+  virtual bool refreshInProgress() const { return false; }
+
+  // Queue a window refresh and return. False means the panel is still busy
+  // and the caller should retry. The default waits inside displayWindow().
+  virtual bool displayWindowDeferred(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y,
+                                     uint16_t w, uint16_t h, RefreshMode mode) {
+    (void)mode;
+    displayWindow(bus, fb, prev, x, y, w, h, false);
+    return true;
+  }
+
   // True when displayStart() defers (returns true) rather than completing
   // inline. Lets the facade skip async scaffolding (shadow setup) on blocking
   // drivers without a trial call, and lets hosts size overlap buffers up
