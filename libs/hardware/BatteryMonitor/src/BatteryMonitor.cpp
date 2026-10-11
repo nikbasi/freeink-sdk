@@ -26,6 +26,8 @@ constexpr uint8_t BQ27220_VOLTAGE = 0x08;          // battery voltage, mV (u16 L
 constexpr uint8_t BQ27220_CURRENT = 0x0C;          // average current, signed mA (i16 LE)
 constexpr uint8_t BQ27220_STATE_OF_CHARGE = 0x2C;  // SoC, percent (u16 LE)
 constexpr uint8_t BQ25896_REG_STATUS = 0x0B;       // CHRG_STAT in bits [4:3]
+constexpr uint8_t SGM41562_REG_STATUS = 0x08;      // CHRG_STAT [4:3]; bit 1 = input present (stock)
+constexpr uint8_t SGM41562_REG_BATFET = 0x06;      // bit 5 = BATFET off (ship mode)
 
 // The gauge's I2C controller (Wire or Wire1) per BoardConfig. On single-bus SoCs
 // (ESP32-C3, SOC_I2C_NUM == 1) Wire1 doesn't exist, so always use Wire there.
@@ -386,6 +388,22 @@ bool readGaugeMillivolts(uint16_t& out) {
   return true;
 }
 
+uint8_t chargerStatusReg() {
+  return BoardConfig::ACTIVE.batteryGauge.chargerType == BoardConfig::ChargerType::Sgm41562 ? SGM41562_REG_STATUS
+                                                                                          : BQ25896_REG_STATUS;
+}
+
+// CHRG_STAT [4:3] from the charger IC: 01 pre-charge or 10 fast-charge means
+// charging (11 = charge done). `known` is false with no charger or a failed read.
+bool readChargerCharging(bool& known) {
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  uint8_t status = 0;
+  known = g.chargerAddr != 0 && readReg8(g.chargerAddr, chargerStatusReg(), status);
+  if (!known) return false;
+  const uint8_t chrg = (status >> 3) & 0x03;
+  return chrg == 0x01 || chrg == 0x02;
+}
+
 // Charging state for an I2C-gauge board, from the active board's gauge config.
 // Two sources, in order of preference:
 //   1. A dedicated charger IC (BQ25896): CHRG_STAT in REG0B[4:3] — 01 pre-charge
@@ -408,14 +426,8 @@ bool readGaugeCharging(bool& known) {
     known = false;
     return false;
   }
-  if (g.chargerAddr != 0) {
-    uint8_t status = 0;
-    if (readReg8(g.chargerAddr, BQ25896_REG_STATUS, status)) {
-      known = true;
-      const uint8_t chrg = (status >> 3) & 0x03;
-      return chrg == 0x01 || chrg == 0x02;
-    }
-  }
+  const bool charging = readChargerCharging(known);
+  if (known) return charging;
   uint16_t raw = 0;
   if (readReg16(g.gaugeAddr, BQ27220_CURRENT, raw)) {
     known = true;
@@ -444,17 +456,59 @@ bool readChargerExternalPower(bool& known) {
     return false;
   }
   uint8_t status = 0;
-  if (!readReg8(g.chargerAddr, BQ25896_REG_STATUS, status)) {
+  if (!readReg8(g.chargerAddr, chargerStatusReg(), status)) {
     known = false;
     return false;
   }
   known = true;
+  // Stock (FUN_4200a124 -> FUN_42011620) treats REG08 bit 1 as "USB present".
+  if (g.chargerType == BoardConfig::ChargerType::Sgm41562) return (status & 0x02) != 0;
   const uint8_t vbus = (status >> 5) & 0x07;
   const bool powerGood = (status & 0x04) != 0;
   return (vbus != 0x00 && vbus != 0x07) || powerGood;
 }
 }  // namespace
 #endif  // FREEINK_BATTERY_I2C_GAUGE
+
+namespace {
+#if FREEINK_DEVICE_PICCO && FREEINK_BATTERY_I2C_GAUGE
+// Onyx Picco: a high-voltage cell (stock programs the charger to 4.35 V), so the
+// generic Li-ion curve reads 100% for the first stretch of discharge. These are
+// the stock firmware's tables (build 2912, DROM 0x3c823ce8 / 0x3c823d3c): battery
+// mV at 100%, 95%, ... 0%, one for charging (terminal voltage runs high under
+// charge current) and one for discharging. Interpolated like stock.
+constexpr uint16_t PICCO_CHARGING_MV[21] = {4305, 4305, 4300, 4290, 4235, 4187, 4124, 4078, 4045, 4013, 3984,
+                                            3961, 3941, 3923, 3906, 3894, 3876, 3840, 3805, 3760, 3500};
+constexpr uint16_t PICCO_DISCHARGING_MV[21] = {4305, 4229, 4171, 4118, 4065, 4019, 3955, 3915, 3876, 3841, 3812,
+                                               3786, 3764, 3745, 3730, 3717, 3697, 3667, 3636, 3565, 3300};
+
+uint16_t piccoPercent(uint16_t mv, bool charging) {
+  const uint16_t* t = charging ? PICCO_CHARGING_MV : PICCO_DISCHARGING_MV;
+  if (mv == 0 || mv <= t[20]) return 0;  // 0 mV = failed read, never "full"
+  if (mv >= t[0]) return 100;
+  uint16_t pct = 0;
+  for (uint8_t i = 1; i <= 20; ++i) {
+    if (mv < t[i]) continue;
+    const uint16_t hi = t[i - 1], lo = t[i];
+    pct = static_cast<uint16_t>(100 - 5 * i + (hi > lo ? 5 * (mv - lo) / (hi - lo) : 5));
+    break;
+  }
+  return static_cast<uint16_t>((pct + 5) / 10 * 10);  // the SDK's 10% notches
+}
+#endif
+
+// Percentage for an ADC-measured battery voltage on the active board.
+uint16_t adcPercentFromMillivolts(uint16_t millivolts) {
+#if FREEINK_DEVICE_PICCO && FREEINK_BATTERY_I2C_GAUGE
+  if (BoardConfig::isPicco()) {
+    bool known = false;
+    const bool charging = readChargerCharging(known);
+    return piccoPercent(millivolts, known && charging);
+  }
+#endif
+  return BatteryMonitor::percentageFromMillivolts(millivolts);
+}
+}  // namespace
 
 namespace {
 constexpr uint8_t M5PM1_REG_PWR_SRC = 0x04;
@@ -521,7 +575,7 @@ uint16_t BatteryMonitor::readPercentage() const {
     return 0;
   }
   if (!hasAdcBackend()) return 0;
-  return percentageFromMillivolts(readMillivolts());
+  return adcPercentFromMillivolts(readMillivolts());
 }
 
 bool BatteryMonitor::readPercentageChecked(uint16_t& out) const {
@@ -540,8 +594,49 @@ bool BatteryMonitor::readPercentageChecked(uint16_t& out) const {
     return true;
   }
   if (!hasAdcBackend()) return false;
-  out = percentageFromMillivolts(readMillivolts());
+  out = adcPercentFromMillivolts(readMillivolts());
   return true;
+}
+
+bool BatteryMonitor::enterShipMode() {
+#if FREEINK_BATTERY_I2C_GAUGE
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.chargerAddr == 0 || g.chargerType != BoardConfig::ChargerType::Sgm41562) return false;
+  uint8_t v = 0;
+  if (!readReg8(g.chargerAddr, SGM41562_REG_BATFET, v)) return false;
+  return writeReg8(g.chargerAddr, SGM41562_REG_BATFET, v | 0x20);
+#else
+  return false;
+#endif
+}
+
+bool BatteryMonitor::configureCharger() {
+#if FREEINK_BATTERY_I2C_GAUGE
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.chargerAddr == 0 || g.chargerType != BoardConfig::ChargerType::Sgm41562) return false;
+  uint8_t gate = 0xFF;
+  if (!readReg8(g.chargerAddr, 0x0B, gate) || gate != 0) return false;
+  // {register, mask, value}, in stock order (FUN_4200a2d0, build 2912).
+  static const uint8_t steps[][3] = {
+      {0x05, 0x60, 0x00},  // FUN_4200a1dc(0)
+      {0x02, 0x7F, 0x3E},
+      {0x06, 0x80, 0x80},  // FUN_4200a1c0(1)
+      {0x01, 0x08, 0x00},  // FUN_4200a17c(1)
+      {0x04, 0xFE, 0xAA},  // FUN_4200a260(4350): charge voltage code 85 = 4.35 V
+      {0x0C, 0x02, 0x00},  // FUN_4200a1a0(2800)
+      {0x0D, 0xF8, 0x48},  // FUN_4200a214(50)
+      {0x01, 0xE0, 0x00},  // FUN_4200a294(8, 2)
+  };
+  for (const auto& s : steps) {
+    uint8_t old = 0;
+    if (!readReg8(g.chargerAddr, s[0], old)) return false;
+    const uint8_t next = static_cast<uint8_t>((old & ~s[1]) | (s[2] & s[1]));
+    if (next != old && !writeReg8(g.chargerAddr, s[0], next)) return false;
+  }
+  return true;
+#else
+  return false;
+#endif
 }
 
 bool BatteryMonitor::loadDesignCapacity() {
@@ -600,13 +695,17 @@ BatteryMonitor::Status BatteryMonitor::readStatus() const {
     status.millivolts = readMillivolts();
     status.millivoltsKnown = status.millivolts > 0;
     if (status.millivoltsKnown) {
-      status.percentage = percentageFromMillivolts(status.millivolts);
+      status.percentage = adcPercentFromMillivolts(status.millivolts);
       status.percentageKnown = true;
     }
     if (_chargeStatusPin >= 0) {
       status.chargingKnown = true;
       status.charging = digitalRead(_chargeStatusPin) == chargeActiveLevel();
     }
+#if FREEINK_BATTERY_I2C_GAUGE
+    if (!status.chargingKnown) status.charging = readChargerCharging(status.chargingKnown);
+    status.externalPower = readChargerExternalPower(status.externalPowerKnown);
+#endif
   }
   return status;
 }
@@ -676,7 +775,12 @@ bool BatteryMonitor::isCharging() const {
     return readM5Pm1Status(status) && status.chargingKnown && status.charging;
   }
   if (_chargeStatusPin < 0) {
+#if FREEINK_BATTERY_I2C_GAUGE
+    bool known = false;
+    return readChargerCharging(known);
+#else
     return false;
+#endif
   }
   // STAT at its board-declared active level (default: MCP73832-style /STAT,
   // LOW while charging).
