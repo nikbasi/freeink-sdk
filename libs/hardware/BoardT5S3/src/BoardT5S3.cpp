@@ -225,16 +225,29 @@ bool parkEpdPowerForSleep() {
       break;
     }
 
-    // OE, MODE, and VCOM off. PWRUP and WAKEUP stay so the boost can still
-    // discharge the panel under the PMIC's control.
+    // OE, MODE, and VCOM off. PWRUP and WAKEUP stay so the negative boost can
+    // discharge the VCOM capacitor (about 4.7µF into 1k) before the rails fall.
     const uint8_t vcomOff =
         static_cast<uint8_t>((output & ~EPD_MASK) | (output & (PWRUP_BIT | WAKEUP_BIT)));
     if (!i2cWriteReg(T5S3_PCA9535_ADDR, PCA_REG_OUTPUT0 + 1, &vcomOff, 1)) continue;
-    delay(10);
+    delay(40);
 
     const uint8_t railsOff = static_cast<uint8_t>(vcomOff & ~PWRUP_BIT);
     if (!i2cWriteReg(T5S3_PCA9535_ADDR, PCA_REG_OUTPUT0 + 1, &railsOff, 1)) continue;
-    delay(20);
+
+    // Default power-down keeps the negative rail up until the positive rail
+    // has fallen, then holds it another 100ms to finish the discharge.
+    // Dropping WAKEUP inside that gap cuts one side first and walks a latched
+    // page back toward grey. PWR_GOOD goes low when the sequenced rails are
+    // down; the extra wait is the negative-rail tail. A stuck pin must not
+    // hang the refresh.
+    const uint32_t railsDownAt = millis();
+    bool powerGood = true;
+    while (millis() - railsDownAt < 250) {
+      if (readPca9535Pin(PCA9535_IO16_TPS_PWR_GOOD, &powerGood) && !powerGood) break;
+      delay(5);
+    }
+    delay(100);
 
     // WAKEUP last: the PMIC wants its outputs disabled before it loses supply.
     const uint8_t parked = static_cast<uint8_t>(railsOff & ~WAKEUP_BIT);

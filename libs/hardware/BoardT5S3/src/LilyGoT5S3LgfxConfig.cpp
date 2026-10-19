@@ -145,13 +145,12 @@ bool prepareEpdPower() {
 }
 
 void epdPowerOff() {
-  // The enable register gates the VCOM amplifier. Clearing the expander pins
-  // alone is not enough: the register stays at the value epdPowerOn() wrote
-  // (all outputs on) until this runs, and VCOM left up washes a settled page
-  // to grey in a few seconds. The write has to happen while WAKEUP is still
-  // high, which it is until parkEpdPowerForSleep() drops it below.
-  writeTpsRegister8(kTpsRegEnable, 0x00);
-
+  // Do not clear the TPS65185 enable register here. 0x00 turns every rail off
+  // at once, including the negative boost that discharges VCOM, and it does
+  // that before the gate-start pin and VCOM_CTRL have gone low. The amplifier
+  // is switched by VCOM_CTRL; parkEpdPowerForSleep() drops that pin while the
+  // boost is still up, then lets the chip's own power-down finish.
+  //
   // Verified, not fire-and-forget. epdPowerOn() checks every write; a NACK on
   // the way down used to leave the TPS65185 enabled with nothing in the log.
   // The expander shares its bus with touch, the gauge, the charger and the RTC.
