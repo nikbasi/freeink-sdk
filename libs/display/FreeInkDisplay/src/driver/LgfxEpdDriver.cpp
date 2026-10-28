@@ -162,6 +162,19 @@ void allocCanvas(uint16_t w, uint16_t h) {
   if (!g_msb) g_msb = static_cast<uint8_t*>(heap_caps_malloc(planeBytes, MALLOC_CAP_SPIRAM));
 }
 
+// The eight canvas bytes each 1-bpp source byte expands to, MSB first. Every
+// refresh expands the whole frame (518 KB of PSRAM writes on a 960x540 panel)
+// before the waveform can start, so this runs one table copy per source byte
+// instead of eight branches.
+struct BwExpandTable {
+  uint8_t px[256][8];
+  constexpr BwExpandTable() : px() {
+    for (int b = 0; b < 256; ++b)
+      for (int bit = 0; bit < 8; ++bit) px[b][bit] = (b & (0x80 >> bit)) ? kGrayWhite : kGrayBlack;
+  }
+};
+constexpr BwExpandTable kBwExpand{};
+
 // Expand a 1-bpp B/W frame (bit set = white) into the 8-bit gray canvas.
 void fillCanvasBW(const uint8_t* fb) {
   if (!g_canvas) return;
@@ -170,10 +183,7 @@ void fillCanvasBW(const uint8_t* fb) {
   for (uint16_t y = 0; y < g_h; ++y) {
     const uint8_t* src = fb + static_cast<uint32_t>(y) * g_wb;
     uint8_t* drow = dst + static_cast<uint32_t>(y) * g_w;
-    for (uint16_t bx = 0; bx < g_wb; ++bx) {
-      const uint8_t b = src[bx];
-      for (uint8_t bit = 0; bit < 8; ++bit) drow[bx * 8 + bit] = (b & (0x80 >> bit)) ? kGrayWhite : kGrayBlack;
-    }
+    for (uint16_t bx = 0; bx < g_wb; ++bx) memcpy(drow + bx * 8, kBwExpand.px[src[bx]], 8);
   }
 }
 
