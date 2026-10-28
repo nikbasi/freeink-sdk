@@ -16,6 +16,11 @@
 
 #include <Arduino.h>
 
+// Feature marker: the clean bank runs 2*L[15] frames (black, then white, greys
+// landed from white) instead of the older 3*L[15]. kCleanLutStep[i] equals
+// kFastLutStep's rail length times this. See docs/launcher-features.md.
+#define FREEINK_ED047TC2_CLEAN_FRAMES_PER_DRIVE 2
+
 namespace freeink {
 namespace ed047tc2 {
 

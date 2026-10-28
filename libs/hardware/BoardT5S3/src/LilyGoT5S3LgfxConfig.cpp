@@ -205,7 +205,7 @@ freeink::LgfxEpdConfig buildConfig() {
   // the particles relax to grey over the next few seconds. 21 frames is the
   // room-temperature impulse; use it as the floor. A warm panel that ghosts a
   // little still holds a page. A page that fades does not.
-  const int waveformC = tempC >= 27 ? 26 : tempC;
+  const int waveformC = tempC > FREEINK_T5S3_WAVEFORM_FLOOR_C ? FREEINK_T5S3_WAVEFORM_FLOOR_C : tempC;
   // Slots for modes this stack never refreshes with. CrossPoint maps FAST to
   // epd_fast and HALF/FULL to epd_text; epd_quality is only ever a WRITE mode
   // (graded pixel quantizer -- the write path reads no LUT) and epd_fastest is

@@ -1,5 +1,9 @@
 #pragma once
 
+// Feature marker: the async task queues stationary long presses for
+// popTouchLongPress(). See docs/launcher-features.md.
+#define FREEINK_HAS_QUEUED_LONG_PRESS 1
+
 // FreeInk SDK — input abstraction.
 //
 // Reads buttons across board input styles (ADC resistor ladder, plain digital

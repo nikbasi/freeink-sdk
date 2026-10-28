@@ -285,16 +285,25 @@ void releaseRails() {
 // start against a waveform that has not raised the flag yet.
 bool gWindowQueued = false;
 uint32_t gWindowIngestUntil = 0;
+// A deferred push returns before its waveform ends, so the rail retry that the
+// blocking paths run after settleDisplay() is owed to whoever first sees the
+// panel idle again.
+bool gReleaseOwed = false;
 
 void markWindowQueued() {
   gWindowQueued = true;
   gWindowIngestUntil = millis() + 4;
+  gReleaseOwed = true;
 }
 
 bool lgfxPanelReady() {
   if (gWindowQueued && static_cast<int32_t>(millis() - gWindowIngestUntil) < 0) return false;
   if (g_dev.displayBusy()) return false;
   gWindowQueued = false;
+  if (gReleaseOwed) {
+    gReleaseOwed = false;
+    releaseRails();
+  }
   return true;
 }
 
@@ -305,16 +314,29 @@ void waitPanelIdle() {
   while (!lgfxPanelReady()) vTaskDelay(1);
   g_dev.waitDisplay();
 }
-void pushCanvas(lgfx::epd_mode::epd_mode_t epdMode) {
+// Every push either waits its waveform out and retries the rail release, or
+// returns at once and leaves both to lgfxPanelReady(). Deferred callers have
+// already observed an idle panel.
+void finishPush(bool wait) {
+  if (wait) {
+    settleDisplay();
+    gWindowQueued = false;
+    gReleaseOwed = false;
+    releaseRails();
+  } else {
+    markWindowQueued();
+  }
+}
+
+void pushCanvas(lgfx::epd_mode::epd_mode_t epdMode, bool wait = true) {
   if (!g_canvas) return;
-  waitPanelIdle();
+  if (wait) waitPanelIdle();
   g_dev.setEpdMode(epdMode);
   g_dev.setAutoDisplay(false);
   g_canvas->pushSprite(0, 0);
   g_dev.setAutoDisplay(true);
   g_dev.display(0, 0, g_w, g_h);
-  settleDisplay();
-  releaseRails();
+  finishPush(wait);
 }
 
 void pushCanvasWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, lgfx::epd_mode::epd_mode_t refreshMode,
@@ -334,12 +356,7 @@ void pushCanvasWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, lgfx::epd_
   g_dev.setEpdMode(refreshMode);
   g_lastBaseEpdMode = refreshMode;
   g_dev.display(x, y, w, h);
-  if (wait) {
-    settleDisplay();
-    gWindowQueued = false;
-  } else {
-    markWindowQueued();
-  }
+  finishPush(wait);
 }
 
 // Push the canvas keeping its grey levels, then refresh through the differential
@@ -357,17 +374,16 @@ void pushCanvasWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, lgfx::epd_
 // pixels land (16 levels, no dither), fast when the refresh goes out (no eraser,
 // and the same LUT bank the B/W base used, so Panel_EPD's per-pixel diff still
 // skips everything that did not change).
-void pushCanvasGraded(lgfx::epd_mode::epd_mode_t refreshMode) {
+void pushCanvasGraded(lgfx::epd_mode::epd_mode_t refreshMode, bool wait = true) {
   if (!g_canvas) return;
-  waitPanelIdle();
+  if (wait) waitPanelIdle();
   g_dev.setEpdMode(lgfx::epd_mode::epd_quality);
   g_dev.setAutoDisplay(false);
   g_canvas->pushSprite(0, 0);  // writes the panel buffer, queues no refresh
   g_dev.setAutoDisplay(true);
   g_dev.setEpdMode(refreshMode);
   g_dev.display(0, 0, g_w, g_h);
-  settleDisplay();
-  releaseRails();
+  finishPush(wait);
 }
 
 // Re-tag every pixel so the clean-bank refresh that follows scrubs the whole
@@ -549,6 +565,33 @@ bool LgfxEpdDriver::displayWindowDeferred(EpdBus& bus, const uint8_t* fb, const 
 #endif
 }
 
+// Queue a whole-frame refresh and return while the waveform runs, so a host
+// can keep reading touch through the one to two seconds a clean refresh takes.
+// The normalize pass in front of a clean refresh still waits: it is one frame,
+// and the clean push must not overtake it.
+bool LgfxEpdDriver::displayFrameDeferred(EpdBus& bus, const uint8_t* fb, RefreshMode mode, bool gray) {
+  (void)bus;
+#if FREEINK_DRIVER_LGFX_EPD
+  if (!fb || !lgfxPanelReady()) return false;
+  fillCanvasBW(fb);
+  if (gray) overlayCanvasGray();
+  const auto epdMode = epdModeFor(mode);
+  if (epdMode == lgfx::epd_mode::epd_text) normalizeForCleanBank();
+  g_lastBaseEpdMode = epdMode;
+  if (gray) {
+    pushCanvasGraded(epdMode, false);
+  } else {
+    pushCanvas(epdMode, false);
+  }
+  return true;
+#else
+  (void)fb;
+  (void)mode;
+  (void)gray;
+  return false;
+#endif
+}
+
 // One render, one push: the whole page -- text and its anti-aliasing greys --
 // reaches the panel as a single waveform.
 //
@@ -568,7 +611,9 @@ void LgfxEpdDriver::displayGrayFrame(EpdBus& bus, const uint8_t* fb, RefreshMode
   (void)bus;
 #if FREEINK_DRIVER_LGFX_EPD
   if (!fb) return;
-  g_dev.waitDisplay();  // never write the canvas while a refresh may be in flight
+  // Never write the canvas while a refresh may be in flight. waitDisplay()
+  // alone misses a deferred push the panel task has not ingested yet.
+  waitPanelIdle();
   fillCanvasBW(fb);
   overlayCanvasGray();
   // HALF/FULL map to the GC16-style clean bank, whose columns land every level

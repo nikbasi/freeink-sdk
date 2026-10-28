@@ -69,6 +69,18 @@ class PanelDriver {
     return true;
   }
 
+  // Queue a whole-frame refresh (gray: compose the staged planes as in
+  // displayGrayFrame) and return. False means the panel is still busy and the
+  // caller should retry. The default refreshes inside the call.
+  virtual bool displayFrameDeferred(EpdBus& bus, const uint8_t* fb, RefreshMode mode, bool gray) {
+    if (gray && supportsGrayFrame()) {
+      displayGrayFrame(bus, fb, mode, false);
+    } else {
+      display(bus, fb, nullptr, mode, false);
+    }
+    return true;
+  }
+
   // True when displayStart() defers (returns true) rather than completing
   // inline. Lets the facade skip async scaffolding (shadow setup) on blocking
   // drivers without a trial call, and lets hosts size overlap buffers up

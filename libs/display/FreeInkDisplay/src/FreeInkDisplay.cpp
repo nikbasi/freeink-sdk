@@ -886,6 +886,29 @@ bool FreeInkDisplay::displayWindowDeferred(uint16_t x, uint16_t y, uint16_t w, u
   return started;
 }
 
+bool FreeInkDisplay::displayFrameDeferred(RefreshMode mode, bool gray) {
+  gray = gray && supportsGrayFrame();
+#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  if (!_inverted && !_inversionDirty && _driver) {
+    if (windowRefreshBusy()) return false;
+    if (!gray) cancelGrayscalePass();
+    DisplayPmLock pmLock;
+    syncPendingAsync();
+    const bool started = _driver->displayFrameDeferred(_bus, frameBuffer, toInternal(mode), gray);
+    if (started) _shadowValid = false;
+    return started;
+  }
+#endif
+  // Double-buffered and inverted output keep their bookkeeping in the
+  // blocking calls.
+  if (gray) {
+    displayGrayscaleFrame(mode, false);
+  } else {
+    displayBuffer(mode, false);
+  }
+  return true;
+}
+
 bool FreeInkDisplay::supportsGrayFrame() const { return !_inverted && _driver && _driver->supportsGrayFrame(); }
 
 void FreeInkDisplay::displayGrayscaleFrame(RefreshMode mode, bool turnOffScreen) {

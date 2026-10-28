@@ -4,6 +4,14 @@
 
 #include "BoardT5S3Pins.h"
 
+// Feature markers. See docs/launcher-features.md.
+// parkEpdPowerForSleep() drops STV, then VCOM, waits for the VCOM discharge,
+// then the boost rails, and WAKEUP last, so a settled page does not fade.
+#define FREEINK_T5S3_STAGED_RAIL_PARK 1
+// Warm panels still get the room-temperature drive length: shorter impulses do
+// not latch and the page relaxes to grey.
+#define FREEINK_T5S3_WAVEFORM_FLOOR_C 26
+
 namespace BoardT5S3 {
 
 class ScopedI2CLock {

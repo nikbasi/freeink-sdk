@@ -1,5 +1,11 @@
 #pragma once
 
+// Feature markers. Hosts check these at compile time so an SDK update that
+// drops one fails the build instead of shipping a slower or ghostier panel.
+// See docs/launcher-features.md.
+#define FREEINK_HAS_DEFERRED_WINDOW 1  // displayWindowDeferred() + windowRefreshBusy()
+#define FREEINK_HAS_DEFERRED_FRAME 1   // displayFrameDeferred()
+
 // FreeInk SDK — display facade.
 //
 // FreeInkDisplay is the stable, hardware-independent display API the firmware
@@ -269,6 +275,11 @@ class FreeInkDisplay {
   // panel is still busy; the framebuffer may be redrawn and the call retried.
   bool displayWindowDeferred(uint16_t x, uint16_t y, uint16_t w, uint16_t h, RefreshMode mode = FAST_REFRESH);
   bool windowRefreshBusy() const;
+  // Queue a whole-frame refresh and return while the waveform runs (gray:
+  // compose the staged planes, as displayGrayscaleFrame does). False when the
+  // panel is still busy; retry later. Drivers without a deferred path, and
+  // double-buffered or inverted output, refresh inside the call.
+  bool displayFrameDeferred(RefreshMode mode, bool gray = false);
   void displayGrayBuffer(bool turnOffScreen = false, const unsigned char* lut = nullptr, bool factoryMode = false);
   // Single-push grayscale: composes the framebuffer (B/W) with the staged
   // LSB/MSB planes and displays them as one waveform. Falls back to a plain

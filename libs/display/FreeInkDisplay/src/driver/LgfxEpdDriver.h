@@ -42,6 +42,7 @@ class LgfxEpdDriver : public PanelDriver {
   bool refreshInProgress() const override;
   bool displayWindowDeferred(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y, uint16_t w,
                              uint16_t h, RefreshMode mode) override;
+  bool displayFrameDeferred(EpdBus& bus, const uint8_t* fb, RefreshMode mode, bool gray) override;
 
   // 16-gray path: the facade streams LSB/MSB 1-bpp planes (whole or in strips);
   // displayGray combines them with the B/W base into the panel's 8-bit gray canvas.
