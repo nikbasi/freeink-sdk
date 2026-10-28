@@ -145,18 +145,18 @@ bool prepareEpdPower() {
 }
 
 void epdPowerOff() {
-  // Verified, not fire-and-forget. epdPowerOn() checks every write; this used to
-  // check none, and the asymmetry is the expensive direction: a NACK on the way
-  // UP fails the refresh and is obvious, while a NACK on the way DOWN leaves the
-  // TPS65185 enabled — tens of milliamps for as long as the device stays asleep,
-  // with nothing on screen and nothing in any log to say so. The expander is on
-  // a bus it shares with the touch controller, the gauge, the charger and the
-  // RTC, so a busy moment is not hypothetical.
+  // Do not clear the TPS65185 enable register here. 0x00 turns every rail off
+  // at once, including the negative boost that discharges VCOM, and it does
+  // that before the gate-start pin and VCOM_CTRL have gone low. The amplifier
+  // is switched by VCOM_CTRL; parkEpdPowerForSleep() drops that pin while the
+  // boost is still up, then lets the chip's own power-down finish.
   //
-  // parkEpdPowerForSleep() is the same operation done as two port writes with a
-  // readback; it runs unconditionally on the way into deep sleep and is what
-  // catches anything this misses mid-session.
-  BoardT5S3::parkEpdPowerForSleep();
+  // Verified, not fire-and-forget. epdPowerOn() checks every write; a NACK on
+  // the way down used to leave the TPS65185 enabled with nothing in the log.
+  // The expander shares its bus with touch, the gauge, the charger and the RTC.
+  if (!BoardT5S3::parkEpdPowerForSleep()) {
+    Serial.printf("[epd] rail park failed, state 0x%02x\n", BoardT5S3::lastEpdParkState());
+  }
 }
 
 bool epdPowerOn() {
@@ -200,6 +200,12 @@ freeink::LgfxEpdConfig buildConfig() {
   int8_t measured = 0;
   const bool measuredOk = readPanelTemperature(&measured);
   const int tempC = measuredOk ? measured : kAssumedTemperatureC;
+  // Ranges from 27 C up cut the black/white impulse to 17, 16, then 14 frames.
+  // That is too short to latch: the page looks right as the waveform ends and
+  // the particles relax to grey over the next few seconds. 21 frames is the
+  // room-temperature impulse; use it as the floor. A warm panel that ghosts a
+  // little still holds a page. A page that fades does not.
+  const int waveformC = tempC >= 27 ? 26 : tempC;
   // Slots for modes this stack never refreshes with. CrossPoint maps FAST to
   // epd_fast and HALF/FULL to epd_text; epd_quality is only ever a WRITE mode
   // (graded pixel quantizer -- the write path reads no LUT) and epd_fastest is
@@ -216,7 +222,7 @@ freeink::LgfxEpdConfig buildConfig() {
   // warmer boots worked. Stubbing the two dead slots puts the fast start near
   // block 70 with room to grow.
   static constexpr uint32_t kUnusedLut[] = {0u};
-  const size_t range = freeink::ed047tc2::tempRangeIndex(tempC);
+  const size_t range = freeink::ed047tc2::tempRangeIndex(waveformC);
   const uint32_t* fast = freeink::ed047tc2::kFastLut[range];
   const size_t fastStep = freeink::ed047tc2::kFastLutStep[range];
   const uint32_t* clean = freeink::ed047tc2::kCleanLut[range];
@@ -231,11 +237,11 @@ freeink::LgfxEpdConfig buildConfig() {
   // decides how the panel looks, it is chosen once and never revisited, and a
   // thermistor that reads high silently under-drives every transition. Without
   // this there is no way to tell a waveform problem from a wrong temperature.
-  Serial.printf("[epd] panel %d C%s -> waveform range %u (%u..%u C), %u drive frames, AA greys at level %u/%u\n",
+  Serial.printf("[epd] panel %d C%s -> waveform range %u (%u..%u C)%s, %u drive frames, AA greys at level %u/%u\n",
                 tempC, measuredOk ? "" : " (assumed, thermistor read failed)", static_cast<unsigned>(range),
                 freeink::ed047tc2::kTempRanges[range].minC, freeink::ed047tc2::kTempRanges[range].maxC,
-                freeink::ed047tc2::kDriveFrames[range], freeink::ed047tc2::kGrayLevelDark[range],
-                freeink::ed047tc2::kGrayLevelLight[range]);
+                waveformC != tempC ? " (drive floored)" : "", freeink::ed047tc2::kDriveFrames[range],
+                freeink::ed047tc2::kGrayLevelDark[range], freeink::ed047tc2::kGrayLevelLight[range]);
 
   // Each slot gets the waveform that matches how Panel_EPD drives it: the
   // differential modes get the vendor DU table extended with the two AA grey

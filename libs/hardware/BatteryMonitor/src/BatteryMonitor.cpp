@@ -26,6 +26,8 @@ constexpr uint8_t BQ27220_VOLTAGE = 0x08;          // battery voltage, mV (u16 L
 constexpr uint8_t BQ27220_CURRENT = 0x0C;          // average current, signed mA (i16 LE)
 constexpr uint8_t BQ27220_STATE_OF_CHARGE = 0x2C;  // SoC, percent (u16 LE)
 constexpr uint8_t BQ25896_REG_STATUS = 0x0B;       // CHRG_STAT in bits [4:3]
+constexpr uint8_t SGM41562_REG_STATUS = 0x08;      // CHRG_STAT [4:3]; bit 1 = input present (stock)
+constexpr uint8_t SGM41562_REG_BATFET = 0x06;      // bit 5 = BATFET off (ship mode)
 
 // The gauge's I2C controller (Wire or Wire1) per BoardConfig. On single-bus SoCs
 // (ESP32-C3, SOC_I2C_NUM == 1) Wire1 doesn't exist, so always use Wire there.
@@ -78,6 +80,123 @@ bool writeReg8(uint8_t addr, uint8_t reg, uint8_t val) {
   w.write(reg);
   w.write(val);
   return w.endTransmission(true) == 0;
+}
+
+// One I2C write per word: the X3's BQ27220 ignores a Control() subcommand split in two.
+bool writeReg16(uint8_t addr, uint8_t reg, uint16_t val) {
+  ensureWire();
+  TwoWire& w = gaugeWire();
+  delayMicroseconds(66);  // BQ27220 bus-free time between transactions
+  w.beginTransmission(addr);
+  w.write(reg);
+  w.write(static_cast<uint8_t>(val & 0xFF));
+  w.write(static_cast<uint8_t>(val >> 8));
+  return w.endTransmission(true) == 0;
+}
+
+// --- BQ27220 Design Capacity -------------------------------------------------
+// TRM SLUUBD4A 6.1: unseal, full access, CONFIG UPDATE, checksummed Data Memory
+// writes, exit with reinit, seal. The X3's gauge ignores keys sent back to back,
+// so they go 1.5 s apart.
+constexpr uint8_t BQ27220_CONTROL = 0x00;
+constexpr uint8_t BQ27220_FULL_CHARGE_CAPACITY = 0x12;
+constexpr uint8_t BQ27220_OPERATION_STATUS = 0x3A;  // CFGUPDATE bit 10, SEC[1:0] bits 2:1
+constexpr uint8_t BQ27220_DESIGN_CAPACITY = 0x3C;
+constexpr uint8_t BQ27220_MAC_CONTROL = 0x3E;
+constexpr uint8_t BQ27220_MAC_DATA = 0x40;
+constexpr uint8_t BQ27220_MAC_DATA_SUM = 0x60;  // MACDataLen() in the high byte
+constexpr uint16_t BQ27220_DM_LEARNED_FCC = 0x929D;
+constexpr uint16_t BQ27220_DM_DESIGN_CAPACITY = 0x929F;
+// Unseal, full access, ENTER_CFG_UPDATE.
+constexpr uint16_t BQ27220_UNLOCK[] = {0x0414, 0x3672, 0xFFFF, 0xFFFF, 0x0090};
+
+struct Bq27220Load {
+  uint8_t step = 0;  // 0 check, 1-5 BQ27220_UNLOCK, 6 Learned FCC, 7 Design Capacity, 8 exit, 9 done
+  bool cfg = false;
+  bool wrote = false;
+  unsigned long at = 0;
+  unsigned long since = 0;
+};
+Bq27220Load bq27220Load;
+
+// A learning cycle moves Learned Full Charge Capacity at most 256 mAh down (TRM
+// 1.1.3), so one learned against TI's 3000 mAh default stays far above a small cell.
+bool bq27220TooHigh(const uint16_t learned, const uint16_t mah) { return learned > mah + mah / 4; }
+
+// Replaces TI's default Design Capacity, or a Learned FCC that is too high, in one
+// big-endian word, adjusting the block checksum by the bytes that change.
+bool bq27220WriteParam(const uint8_t addr, const uint16_t address, const uint16_t mah) {
+  uint16_t old = 0;
+  uint16_t sum = 0;
+  if (!writeReg16(addr, BQ27220_MAC_CONTROL, address)) return false;
+  delay(10);
+  if (!readReg16(addr, BQ27220_MAC_DATA, old) || !readReg16(addr, BQ27220_MAC_DATA_SUM, sum)) return false;
+  const uint16_t value = __builtin_bswap16(old);
+  if (address == BQ27220_DM_LEARNED_FCC ? !bq27220TooHigh(value, mah) : value != 3000) return true;
+  bq27220Load.wrote = true;
+  sum = (sum & 0xFF00) | static_cast<uint8_t>(sum + (old & 0xFF) + (old >> 8) - (mah & 0xFF) - (mah >> 8));
+  // Reading MACDataSum() moves the X3's gauge to the next block: select this one again.
+  if (!writeReg16(addr, BQ27220_MAC_CONTROL, address)) return false;
+  delay(10);
+  return writeReg16(addr, BQ27220_MAC_DATA, __builtin_bswap16(mah)) && writeReg16(addr, BQ27220_MAC_DATA_SUM, sum);
+}
+
+bool bq27220LoadStep(const uint8_t addr, const uint16_t mah, const unsigned long now) {
+  Bq27220Load& s = bq27220Load;
+  if (s.step == 9 || static_cast<long>(now - s.at) < 0) return s.step != 9;
+  const auto next = [&](const uint8_t step, const unsigned long gap) {
+    s.step = step;
+    s.at = now + gap;
+    return true;
+  };
+  // Leaves CONFIG UPDATE (with reinit once a block was written), then seals.
+  const auto close = [&] {
+    if (s.cfg) {
+      s.cfg = false;
+      s.since = now;
+      if (writeReg16(addr, BQ27220_CONTROL, s.wrote ? 0x0091 : 0x0092)) return next(8, 500);
+    }
+    writeReg16(addr, BQ27220_CONTROL, 0x0030);
+    s.step = 9;
+    return false;
+  };
+  uint16_t status = 0;
+  if (s.step == 0) {
+    uint16_t dc = 0;
+    uint16_t fcc = 0;
+    s.step = 9;
+    if (!readReg16(addr, BQ27220_DESIGN_CAPACITY, dc) || !readReg16(addr, BQ27220_OPERATION_STATUS, status)) {
+      return false;
+    }
+    s.cfg = status & 0x0400;
+    const uint8_t security = (status >> 1) & 3;
+    if (dc == mah && (s.cfg || security != 3)) {
+      s.wrote = true;  // an earlier load was cut short
+      return close();
+    }
+    if (dc == mah ? !readReg16(addr, BQ27220_FULL_CHARGE_CAPACITY, fcc) || !bq27220TooHigh(fcc, mah) : dc != 3000) {
+      return false;
+    }
+    s.step = security == 3 ? 1 : security == 1 ? 5 : 3;
+  }
+  if (s.step <= 5) {
+    s.cfg |= s.step == 5;
+    s.since = now;
+    if (!writeReg16(addr, BQ27220_CONTROL, BQ27220_UNLOCK[s.step - 1])) return close();
+    return next(s.step + 1, s.step == 5 ? 500 : 1500);
+  }
+  if (s.step == 6 || s.step == 8) {
+    const bool reached =
+        readReg16(addr, BQ27220_OPERATION_STATUS, status) && ((status & 0x0400) != 0) == (s.step == 6);
+    if (!reached && now - s.since < 5000) return next(s.step, 500);
+    // Learned FCC first, Design Capacity half a second later: the X3's gauge can miss
+    // a block select sent right after a block write. If anything fails, Design
+    // Capacity still reads 3000 or FullChargeCapacity() too high, and the next start retries.
+    if (s.step == 6 && reached && bq27220WriteParam(addr, BQ27220_DM_LEARNED_FCC, mah)) return next(7, 500);
+  } else {
+    bq27220WriteParam(addr, BQ27220_DM_DESIGN_CAPACITY, mah);
+  }
+  return close();
 }
 
 // --- CW2017 (CellWise) fuel gauge -------------------------------------------
@@ -269,6 +388,22 @@ bool readGaugeMillivolts(uint16_t& out) {
   return true;
 }
 
+uint8_t chargerStatusReg() {
+  return BoardConfig::ACTIVE.batteryGauge.chargerType == BoardConfig::ChargerType::Sgm41562 ? SGM41562_REG_STATUS
+                                                                                          : BQ25896_REG_STATUS;
+}
+
+// CHRG_STAT [4:3] from the charger IC: 01 pre-charge or 10 fast-charge means
+// charging (11 = charge done). `known` is false with no charger or a failed read.
+bool readChargerCharging(bool& known) {
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  uint8_t status = 0;
+  known = g.chargerAddr != 0 && readReg8(g.chargerAddr, chargerStatusReg(), status);
+  if (!known) return false;
+  const uint8_t chrg = (status >> 3) & 0x03;
+  return chrg == 0x01 || chrg == 0x02;
+}
+
 // Charging state for an I2C-gauge board, from the active board's gauge config.
 // Two sources, in order of preference:
 //   1. A dedicated charger IC (BQ25896): CHRG_STAT in REG0B[4:3] — 01 pre-charge
@@ -291,14 +426,8 @@ bool readGaugeCharging(bool& known) {
     known = false;
     return false;
   }
-  if (g.chargerAddr != 0) {
-    uint8_t status = 0;
-    if (readReg8(g.chargerAddr, BQ25896_REG_STATUS, status)) {
-      known = true;
-      const uint8_t chrg = (status >> 3) & 0x03;
-      return chrg == 0x01 || chrg == 0x02;
-    }
-  }
+  const bool charging = readChargerCharging(known);
+  if (known) return charging;
   uint16_t raw = 0;
   if (readReg16(g.gaugeAddr, BQ27220_CURRENT, raw)) {
     known = true;
@@ -327,17 +456,59 @@ bool readChargerExternalPower(bool& known) {
     return false;
   }
   uint8_t status = 0;
-  if (!readReg8(g.chargerAddr, BQ25896_REG_STATUS, status)) {
+  if (!readReg8(g.chargerAddr, chargerStatusReg(), status)) {
     known = false;
     return false;
   }
   known = true;
+  // Stock (FUN_4200a124 -> FUN_42011620) treats REG08 bit 1 as "USB present".
+  if (g.chargerType == BoardConfig::ChargerType::Sgm41562) return (status & 0x02) != 0;
   const uint8_t vbus = (status >> 5) & 0x07;
   const bool powerGood = (status & 0x04) != 0;
   return (vbus != 0x00 && vbus != 0x07) || powerGood;
 }
 }  // namespace
 #endif  // FREEINK_BATTERY_I2C_GAUGE
+
+namespace {
+#if FREEINK_DEVICE_PICCO && FREEINK_BATTERY_I2C_GAUGE
+// Onyx Picco: a high-voltage cell (stock programs the charger to 4.35 V), so the
+// generic Li-ion curve reads 100% for the first stretch of discharge. These are
+// the stock firmware's tables (build 2912, DROM 0x3c823ce8 / 0x3c823d3c): battery
+// mV at 100%, 95%, ... 0%, one for charging (terminal voltage runs high under
+// charge current) and one for discharging. Interpolated like stock.
+constexpr uint16_t PICCO_CHARGING_MV[21] = {4305, 4305, 4300, 4290, 4235, 4187, 4124, 4078, 4045, 4013, 3984,
+                                            3961, 3941, 3923, 3906, 3894, 3876, 3840, 3805, 3760, 3500};
+constexpr uint16_t PICCO_DISCHARGING_MV[21] = {4305, 4229, 4171, 4118, 4065, 4019, 3955, 3915, 3876, 3841, 3812,
+                                               3786, 3764, 3745, 3730, 3717, 3697, 3667, 3636, 3565, 3300};
+
+uint16_t piccoPercent(uint16_t mv, bool charging) {
+  const uint16_t* t = charging ? PICCO_CHARGING_MV : PICCO_DISCHARGING_MV;
+  if (mv == 0 || mv <= t[20]) return 0;  // 0 mV = failed read, never "full"
+  if (mv >= t[0]) return 100;
+  uint16_t pct = 0;
+  for (uint8_t i = 1; i <= 20; ++i) {
+    if (mv < t[i]) continue;
+    const uint16_t hi = t[i - 1], lo = t[i];
+    pct = static_cast<uint16_t>(100 - 5 * i + (hi > lo ? 5 * (mv - lo) / (hi - lo) : 5));
+    break;
+  }
+  return static_cast<uint16_t>((pct + 5) / 10 * 10);  // the SDK's 10% notches
+}
+#endif
+
+// Percentage for an ADC-measured battery voltage on the active board.
+uint16_t adcPercentFromMillivolts(uint16_t millivolts) {
+#if FREEINK_DEVICE_PICCO && FREEINK_BATTERY_I2C_GAUGE
+  if (BoardConfig::isPicco()) {
+    bool known = false;
+    const bool charging = readChargerCharging(known);
+    return piccoPercent(millivolts, known && charging);
+  }
+#endif
+  return BatteryMonitor::percentageFromMillivolts(millivolts);
+}
+}  // namespace
 
 namespace {
 constexpr uint8_t M5PM1_REG_PWR_SRC = 0x04;
@@ -404,7 +575,7 @@ uint16_t BatteryMonitor::readPercentage() const {
     return 0;
   }
   if (!hasAdcBackend()) return 0;
-  return percentageFromMillivolts(readMillivolts());
+  return adcPercentFromMillivolts(readMillivolts());
 }
 
 bool BatteryMonitor::readPercentageChecked(uint16_t& out) const {
@@ -423,8 +594,59 @@ bool BatteryMonitor::readPercentageChecked(uint16_t& out) const {
     return true;
   }
   if (!hasAdcBackend()) return false;
-  out = percentageFromMillivolts(readMillivolts());
+  out = adcPercentFromMillivolts(readMillivolts());
   return true;
+}
+
+bool BatteryMonitor::enterShipMode() {
+#if FREEINK_BATTERY_I2C_GAUGE
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.chargerAddr == 0 || g.chargerType != BoardConfig::ChargerType::Sgm41562) return false;
+  uint8_t v = 0;
+  if (!readReg8(g.chargerAddr, SGM41562_REG_BATFET, v)) return false;
+  return writeReg8(g.chargerAddr, SGM41562_REG_BATFET, v | 0x20);
+#else
+  return false;
+#endif
+}
+
+bool BatteryMonitor::configureCharger() {
+#if FREEINK_BATTERY_I2C_GAUGE
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.chargerAddr == 0 || g.chargerType != BoardConfig::ChargerType::Sgm41562) return false;
+  uint8_t gate = 0xFF;
+  if (!readReg8(g.chargerAddr, 0x0B, gate) || gate != 0) return false;
+  // {register, mask, value}, in stock order (FUN_4200a2d0, build 2912).
+  static const uint8_t steps[][3] = {
+      {0x05, 0x60, 0x00},  // FUN_4200a1dc(0)
+      {0x02, 0x7F, 0x3E},
+      {0x06, 0x80, 0x80},  // FUN_4200a1c0(1)
+      {0x01, 0x08, 0x00},  // FUN_4200a17c(1)
+      {0x04, 0xFE, 0xAA},  // FUN_4200a260(4350): charge voltage code 85 = 4.35 V
+      {0x0C, 0x02, 0x00},  // FUN_4200a1a0(2800)
+      {0x0D, 0xF8, 0x48},  // FUN_4200a214(50)
+      {0x01, 0xE0, 0x00},  // FUN_4200a294(8, 2)
+  };
+  for (const auto& s : steps) {
+    uint8_t old = 0;
+    if (!readReg8(g.chargerAddr, s[0], old)) return false;
+    const uint8_t next = static_cast<uint8_t>((old & ~s[1]) | (s[2] & s[1]));
+    if (next != old && !writeReg8(g.chargerAddr, s[0], next)) return false;
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool BatteryMonitor::loadDesignCapacity() {
+#if FREEINK_BATTERY_I2C_GAUGE
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.gaugeType == BoardConfig::GaugeType::Bq27220 && g.designCapacityMah != 0) {
+    return bq27220LoadStep(g.gaugeAddr, g.designCapacityMah, millis());
+  }
+#endif
+  return false;
 }
 
 BatteryMonitor::Status BatteryMonitor::readStatus() const {
@@ -473,13 +695,17 @@ BatteryMonitor::Status BatteryMonitor::readStatus() const {
     status.millivolts = readMillivolts();
     status.millivoltsKnown = status.millivolts > 0;
     if (status.millivoltsKnown) {
-      status.percentage = percentageFromMillivolts(status.millivolts);
+      status.percentage = adcPercentFromMillivolts(status.millivolts);
       status.percentageKnown = true;
     }
     if (_chargeStatusPin >= 0) {
       status.chargingKnown = true;
       status.charging = digitalRead(_chargeStatusPin) == chargeActiveLevel();
     }
+#if FREEINK_BATTERY_I2C_GAUGE
+    if (!status.chargingKnown) status.charging = readChargerCharging(status.chargingKnown);
+    status.externalPower = readChargerExternalPower(status.externalPowerKnown);
+#endif
   }
   return status;
 }
@@ -549,7 +775,12 @@ bool BatteryMonitor::isCharging() const {
     return readM5Pm1Status(status) && status.chargingKnown && status.charging;
   }
   if (_chargeStatusPin < 0) {
+#if FREEINK_BATTERY_I2C_GAUGE
+    bool known = false;
+    return readChargerCharging(known);
+#else
     return false;
+#endif
   }
   // STAT at its board-declared active level (default: MCP73832-style /STAT,
   // LOW while charging).

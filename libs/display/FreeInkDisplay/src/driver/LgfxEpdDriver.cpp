@@ -271,6 +271,15 @@ void settleDisplay() {
   g_dev.waitDisplay();
 }
 
+// The update task turns the rails off when the waveform ends, and it clears
+// its "power is on" flag even when that turn-off did not stick. VCOM left
+// asserted washes a clean page to grey in a few seconds. The hook is
+// idempotent; running it again from here is the retry the task cannot do
+// once it has cleared the flag. deepSleep() does the same thing.
+void releaseRails() {
+  if (g_hooks && g_hooks->powerOff) g_hooks->powerOff();
+}
+
 // A queued refresh is not busy until the panel task has taken the job. Trust
 // displayBusy() only after this short ingest window, or the next push can
 // start against a waveform that has not raised the flag yet.
@@ -305,6 +314,7 @@ void pushCanvas(lgfx::epd_mode::epd_mode_t epdMode) {
   g_dev.setAutoDisplay(true);
   g_dev.display(0, 0, g_w, g_h);
   settleDisplay();
+  releaseRails();
 }
 
 void pushCanvasWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, lgfx::epd_mode::epd_mode_t refreshMode,
@@ -357,6 +367,7 @@ void pushCanvasGraded(lgfx::epd_mode::epd_mode_t refreshMode) {
   g_dev.setEpdMode(refreshMode);
   g_dev.display(0, 0, g_w, g_h);
   settleDisplay();
+  releaseRails();
 }
 
 // Re-tag every pixel so the clean-bank refresh that follows scrubs the whole

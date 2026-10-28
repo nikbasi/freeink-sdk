@@ -58,6 +58,13 @@ class PowerManager {
   // button, an IO-expander INT. The pins must be RTC-capable on ext1 parts.
   static void armWakeOnPins(uint64_t gpioMask, bool wakeLow = true);
 
+  // Extra active-low keys that armPowerButtonWakeup() arms alongside an
+  // active-low power pin, for the next deep sleep only (plain RAM). Pins that
+  // cannot wake the chip from deep sleep (non-RTC pads on ext1 parts) are
+  // dropped here, since one invalid pin makes the SoC reject the whole mask --
+  // the power button included.
+  static void setExtraWakePins(uint64_t gpioMask);
+
   // Poll the power-button GPIO (raw read, with the matching pull) until released,
   // so deep sleep isn't immediately cancelled by a still-held press. Bounded by
   // RELEASE_WAIT_MAX_MS. Returns the milliseconds spent waiting; the caller

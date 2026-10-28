@@ -35,7 +35,11 @@ class GfxRendererTarget final : public DrawTarget {
   static constexpr FontId FONT_SMALL = 0;
   static constexpr FontId FONT_BODY = 1;
   static constexpr FontId FONT_TITLE = 2;
-  static constexpr size_t FONT_SLOTS = 3;
+  // Status/label chrome (header battery percent, clock). Follows FONT_SMALL
+  // unless bound explicitly, so apps whose FONT_SMALL scales with the UI can
+  // pin chrome to a fixed size without touching list subtitles.
+  static constexpr FontId FONT_LABEL = 3;
+  static constexpr size_t FONT_SLOTS = 4;
 
   explicit GfxRendererTarget(const GfxRenderer& renderer, const bool hasTouch = false)
       : renderer(renderer), hasTouch_(hasTouch) {
@@ -93,6 +97,28 @@ class GfxRendererTarget final : public DrawTarget {
 
   int16_t lineHeight(const FontId font) const override {
     return static_cast<int16_t>(renderer.getLineHeight(gfxFont(font)));
+  }
+
+  // Ink from glyph metrics: drawText puts the baseline `ascender` below the
+  // line top, and a glyph's ink starts `top` above the baseline.
+  // ponytail: ASCII only (status labels, clocks); other text keeps the line box.
+  Rect inkBounds(const FontId font, const char* text, const TextStyle style) const override {
+    const Rect lineBox = DrawTarget::inkBounds(font, text, style);
+    const int fontId = gfxFont(font);
+    const auto it = renderer.getFontMap().find(fontId);
+    if (!text || it == renderer.getFontMap().end()) return lineBox;
+    const int ascender = renderer.getFontAscenderSize(fontId);
+    int top = lineBox.height;
+    int bottom = 0;
+    for (const char* p = text; *p; ++p) {
+      if (static_cast<unsigned char>(*p) >= 0x80) return lineBox;
+      const auto glyph = it->second.getGlyph(static_cast<uint32_t>(*p), fontStyle(style));
+      if (!glyph || glyph->height <= 0) continue;
+      top = std::min(top, ascender - static_cast<int>(glyph->top));
+      bottom = std::max(bottom, ascender - static_cast<int>(glyph->top) + static_cast<int>(glyph->height));
+    }
+    if (top >= bottom) return lineBox;
+    return Rect{0, static_cast<int16_t>(top), lineBox.width, static_cast<int16_t>(bottom - top)};
   }
 
   void fill(const Rect rect, const Paint paint, const uint8_t radius = 0,
@@ -323,7 +349,11 @@ class GfxRendererTarget final : public DrawTarget {
   bool hasTouch_ = false;
   int fonts[FONT_SLOTS];
 
-  int gfxFont(const FontId slot) const { return slot < FONT_SLOTS ? fonts[slot] : fonts[FONT_BODY]; }
+  int gfxFont(const FontId slot) const {
+    // FONT_LABEL follows FONT_SMALL until an app binds it explicitly.
+    if (slot == FONT_LABEL && fonts[FONT_LABEL] == 0) return fonts[FONT_SMALL];
+    return slot < FONT_SLOTS ? fonts[slot] : fonts[FONT_BODY];
+  }
 
   // FreeInkUI colors map onto GfxRenderer's Bayer dither levels.
   static ::Color gfxColor(const Color color) {
@@ -359,6 +389,7 @@ class GfxRendererFrame {
     target.setFont(GfxRendererTarget::FONT_SMALL, smallFontId);
     target.setFont(GfxRendererTarget::FONT_BODY, bodyFontId);
     target.setFont(GfxRendererTarget::FONT_TITLE, titleFontId);
+    target.setFont(GfxRendererTarget::FONT_LABEL, smallFontId);
   }
 
   GfxRendererTarget target;

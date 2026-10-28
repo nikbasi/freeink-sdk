@@ -46,8 +46,8 @@ carry its greys in the same push as its text: no separate B/W base pass exists
 to pre-position the fringe, and none is needed.
 
 epd_text/epd_quality become a true GC16-style refresh: every one of the 16
-columns rail-normalizes (dark half to white, light half to black) and then
-walks to its exact level. Destination-indexed yet source-independent, it both
+columns reaches a rail and lands from there (greys from white, as in the fast
+bank), 2*L[15] frames in all. Destination-indexed yet source-independent, it both
 scrubs residue and resets any accumulated DC bias, because the saturating rail
 visit erases a pixel's drive history.
 
@@ -266,27 +266,39 @@ def fast_rows(l15, dark, l_dark, light, l_light):
 def clean_rows(impulse):
     """The GC16-style clean bank for epd_text / epd_quality.
 
-    Three phases, uniform across all 16 columns so the refresh reads as a
-    blink rather than as noise: every pixel drives to the black rail for L[15]
-    frames, then to the white rail for L[15], then walks down from white to its
-    exact level (L[15]-L[i] frames toward black). The double rail excursion is
-    the scrub -- it erases drive history and accumulated DC bias -- and the
-    final descent lands every level, greys included, precisely.
+    2*L[15] frames, every column driven on every frame, each column ending on
+    the last frame:
 
-    An earlier cut of this bank sent each pixel to the rail OPPOSITE its
-    destination and back, which scrubbed and landed just as well but showed the
-    old page fading THROUGH the new page inverted, both at once: on a real
-    device the cadence refresh read as a screenful of garbage before the text
-    resolved. Same physics, reordered for the eye watching it.
+      black (0)      black for all 2*L[15] frames
+      white (15)     black L[15], then white L[15]
+      grey  (1..14)  white L[15]+L[i], then black L[15]-L[i]
+
+    The background, where ghosts show, makes a full black-to-white excursion:
+    that is the scrub. The greys land exactly the way the fast bank lands them
+    -- saturate at the white rail, then walk down -- because on the glass a
+    grey reached from white and one reached from black are NOT the same shade,
+    whatever the separable impulse model says. A cut that walked the greys up
+    from black read as washed-out anti-aliasing after every clean refresh,
+    darkening back only on the next page turn. The white rail clamps, so the
+    extra L[i] white frames only lengthen the saturation.
+
+    No column ever parks while its neighbours are still driven. A cut that let
+    black pixels sit undriven through the walk-up read as faded text: the
+    strokes relaxed toward grey while everything around them was pushed white.
+
+    Visually the page drops to black with its greys flashing light, then the
+    background rises and the fringe settles -- one blink, no inverted image.
+    The previous 3*L[15] cut (black, white, walk down) reached the same landing
+    a third slower; an earlier one that drove each pixel to the rail OPPOSITE
+    its destination showed the old page fading through the new one inverted.
     """
     l15 = impulse[15]
     rows = []
-    for _ in range(l15):
-        rows.append("    LUT_MAKE(%s)," % ", ".join(["1"] * 16))
-    for _ in range(l15):
-        rows.append("    LUT_MAKE(%s)," % ", ".join(["2"] * 16))
-    for f in range(l15):
-        codes = ["1" if f < l15 - impulse[i] else "3" for i in range(16)]
+    for f in range(2 * l15):
+        codes = ["1"] * 16
+        codes[15] = "1" if f < l15 else "2"
+        for i in range(1, 15):
+            codes[i] = "2" if f < l15 + impulse[i] else "1"
         rows.append("    LUT_MAKE(%s)," % ", ".join(codes))
     return rows
 
@@ -326,8 +338,8 @@ HEADER = '''// GENERATED FILE -- DO NOT EDIT BY HAND.
 // had accumulated.
 //
 // kCleanLut (epd_text / epd_quality): a GC16-style refresh. Every one of the 16
-// columns rail-normalizes (dark half to white, light half to black) and then
-// walks to its exact level, so the periodic clean page both scrubs residue and
+// columns reaches a rail and lands from there: the background via a black
+// excursion, the greys from white exactly as the fast bank lands them, so the periodic clean page both scrubs residue and
 // re-lands every grey precisely. The previous bank drove each level away and
 // symmetrically back, which is only a correct landing for the two rails; any
 // grey pushed through it ended on a rail.

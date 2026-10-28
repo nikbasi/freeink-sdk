@@ -188,15 +188,22 @@ bool readButton() {
 }
 
 bool parkEpdPowerForSleep() {
-  // All five EPD control lines live in port 1 (linear indexes 8..15), so the
-  // park is two register writes rather than ten read-modify-writes on a bus that
-  // is about to lose its last chance to be retried.
-  constexpr uint8_t EPD_MASK = static_cast<uint8_t>((1U << (PCA9535_IO10_EP_OE - 8)) |
-                                                    (1U << (PCA9535_IO11_EP_MODE - 8)) |
-                                                    (1U << (PCA9535_IO13_TPS_PWRUP - 8)) |
-                                                    (1U << (PCA9535_IO14_VCOM_CTRL - 8)) |
-                                                    (1U << (PCA9535_IO15_TPS_WAKEUP - 8)));
+  // All five EPD control lines live in port 1 (linear indexes 8..15).
+  //
+  // VCOM has to fall before the boost rails do, and the gate-start pin has to
+  // be low before either. Dropping them in one write leaves the common plane
+  // biased while a gate is still selected, and the glass then drifts to grey
+  // over a few seconds on a page that had just looked clean.
+  constexpr uint8_t OE_BIT = static_cast<uint8_t>(1U << (PCA9535_IO10_EP_OE - 8));
+  constexpr uint8_t MODE_BIT = static_cast<uint8_t>(1U << (PCA9535_IO11_EP_MODE - 8));
+  constexpr uint8_t PWRUP_BIT = static_cast<uint8_t>(1U << (PCA9535_IO13_TPS_PWRUP - 8));
+  constexpr uint8_t VCOM_BIT = static_cast<uint8_t>(1U << (PCA9535_IO14_VCOM_CTRL - 8));
   constexpr uint8_t WAKEUP_BIT = static_cast<uint8_t>(1U << (PCA9535_IO15_TPS_WAKEUP - 8));
+  constexpr uint8_t EPD_MASK = static_cast<uint8_t>(OE_BIT | MODE_BIT | PWRUP_BIT | VCOM_BIT | WAKEUP_BIT);
+
+  // Stop the gate driver before the supply moves.
+  pinMode(EP_STV, OUTPUT);
+  digitalWrite(EP_STV, LOW);
 
   ensureParkState();
   s_lastParkOk = false;
@@ -210,12 +217,40 @@ bool parkEpdPowerForSleep() {
     const uint8_t wantConfig = static_cast<uint8_t>(config & ~EPD_MASK);
     if (wantConfig != config && !i2cWriteReg(T5S3_PCA9535_ADDR, PCA_REG_CONFIG0 + 1, &wantConfig, 1)) continue;
 
-    // Rails and VCOM down first, WAKEUP last, matching epdPowerOff()'s order:
-    // the PMIC wants its outputs disabled before it loses its own supply.
-    uint8_t staged = static_cast<uint8_t>((output & ~EPD_MASK) | (output & WAKEUP_BIT));
-    if (!i2cWriteReg(T5S3_PCA9535_ADDR, PCA_REG_OUTPUT0 + 1, &staged, 1)) continue;
-    delay(1);
-    const uint8_t parked = static_cast<uint8_t>(staged & ~WAKEUP_BIT);
+    // Already parked (the post-refresh retry). The discharge waits below are
+    // only there for a rail that is still up.
+    if ((output & EPD_MASK) == 0) {
+      s_lastParkState = output;
+      s_lastParkOk = true;
+      break;
+    }
+
+    // OE, MODE, and VCOM off. PWRUP and WAKEUP stay so the negative boost can
+    // discharge the VCOM capacitor (about 4.7µF into 1k) before the rails fall.
+    const uint8_t vcomOff =
+        static_cast<uint8_t>((output & ~EPD_MASK) | (output & (PWRUP_BIT | WAKEUP_BIT)));
+    if (!i2cWriteReg(T5S3_PCA9535_ADDR, PCA_REG_OUTPUT0 + 1, &vcomOff, 1)) continue;
+    delay(40);
+
+    const uint8_t railsOff = static_cast<uint8_t>(vcomOff & ~PWRUP_BIT);
+    if (!i2cWriteReg(T5S3_PCA9535_ADDR, PCA_REG_OUTPUT0 + 1, &railsOff, 1)) continue;
+
+    // Default power-down keeps the negative rail up until the positive rail
+    // has fallen, then holds it another 100ms to finish the discharge.
+    // Dropping WAKEUP inside that gap cuts one side first and walks a latched
+    // page back toward grey. PWR_GOOD goes low when the sequenced rails are
+    // down; the extra wait is the negative-rail tail. A stuck pin must not
+    // hang the refresh.
+    const uint32_t railsDownAt = millis();
+    bool powerGood = true;
+    while (millis() - railsDownAt < 250) {
+      if (readPca9535Pin(PCA9535_IO16_TPS_PWR_GOOD, &powerGood) && !powerGood) break;
+      delay(5);
+    }
+    delay(100);
+
+    // WAKEUP last: the PMIC wants its outputs disabled before it loses supply.
+    const uint8_t parked = static_cast<uint8_t>(railsOff & ~WAKEUP_BIT);
     if (!i2cWriteReg(T5S3_PCA9535_ADDR, PCA_REG_OUTPUT0 + 1, &parked, 1)) continue;
 
     uint8_t readback = 0;
@@ -227,10 +262,6 @@ bool parkEpdPowerForSleep() {
     }
   }
 
-  // STV is a plain GPIO, so it costs nothing to park here too and keeps the
-  // panel's gate driver from being handed a level while its supply collapses.
-  pinMode(EP_STV, OUTPUT);
-  digitalWrite(EP_STV, LOW);
   return s_lastParkOk;
 }
 

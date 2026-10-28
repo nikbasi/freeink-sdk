@@ -211,7 +211,7 @@ class SecureHttpClient {
     for (int attempt = 0; attempt < 2; ++attempt) {
       const bool reusing = connectionMatches();
       if (isAborted(shouldAbort)) return -1;
-      if (!ensureConnected()) return -1;
+      if (!ensureConnected(shouldAbort)) return -1;
 
       if (!writeRequest(method, payload, payloadLen)) {
         closeConnection();
@@ -314,6 +314,20 @@ class SecureHttpClient {
     return found == _responseHeaders.end() ? "" : found->value;
   }
 
+  // Borrow one unambiguous response header without copying the header collection
+  // or its values. Pass a lowercased name. Null means absent or duplicated;
+  // the pointer stays valid only until begin(), another request, or destruction.
+  const std::string* getUniqueHeader(const char* lowercaseName) const {
+    if (!lowercaseName) return nullptr;
+    const std::string* value = nullptr;
+    for (const auto& header : _responseHeaders) {
+      if (header.name != lowercaseName) continue;
+      if (value) return nullptr;
+      value = &header.value;
+    }
+    return value;
+  }
+
   // All response headers, in receive order, as (lowercased-name, value) pairs.
   // Order-preserving and duplicate-preserving so callers can see every
   // Set-Cookie (or other repeated header) rather than just the first.
@@ -404,7 +418,13 @@ class SecureHttpClient {
   }
 
   // Reuse the kept-alive connection when it matches, else (re)connect.
-  bool ensureConnected() {
+  //
+  // shouldAbort is handed to the TLS client so a cancel is honoured during
+  // DNS/TCP/handshake too. Without it the read loops are cancellable but the
+  // connect ahead of them is not, and a caller that shows a cancel affordance
+  // is promising something it cannot deliver for the longest part of a failing
+  // request.
+  bool ensureConnected(const AbortCallback& shouldAbort = nullptr) {
     if (connectionMatches()) return true;
     closeConnection();
     if (_scheme == "https") {
@@ -414,7 +434,11 @@ class SecureHttpClient {
         _secure.setCACert(_rootCA);
       }
       _secure.setTimeout(_timeoutMs);
-      if (!_secure.connect(_host.c_str(), _port)) return false;
+      _secure.setAbortCallback(shouldAbort);
+      if (!_secure.connect(_host.c_str(), _port)) {
+        if (_secure.aborted()) _aborted = true;
+        return false;
+      }
       _conn = &_secure;
       _connHttps = true;
     } else {

@@ -6,6 +6,9 @@
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <soc/soc_caps.h>
+#if SOC_PM_SUPPORT_EXT1_WAKEUP
+#include <driver/rtc_io.h>
+#endif
 #if FREEINK_DEVICE_WS397
 #include <Axp2101.h>
 #endif
@@ -21,6 +24,9 @@ PowerManager::SleepParkHook s_parkHook = nullptr;
 // cannot survive a sleep and re-arm itself by accident.
 uint32_t s_debugTimerWakeSeconds = 0;
 bool s_debugSimulateHeld = false;
+
+// Consumed by armPowerButtonWakeup(); see setExtraWakePins().
+uint64_t s_extraWakeMask = 0;
 
 // Sleep-entry telemetry. RTC_NOINIT rather than plain statics because every
 // interesting value here is produced on the way INTO sleep, after the SD card is
@@ -86,12 +92,39 @@ void PowerManager::armWakeOnPins(uint64_t gpioMask, bool wakeLow) {
   const esp_sleep_ext1_wakeup_mode_t lowMode = ESP_EXT1_WAKEUP_ANY_LOW;
 #endif
   esp_sleep_enable_ext1_wakeup(gpioMask, wakeLow ? lowMode : ESP_EXT1_WAKEUP_ANY_HIGH);
+  // ext1 hands each pad to the RTC domain for sleep, where the digital pull from
+  // pinMode() does not apply and esp_sleep_config_gpio_isolate() floats the pad.
+  // Set the idle-level pull in the RTC domain and keep that domain powered so it
+  // holds; a pin without an external resistor otherwise floats and wakes at random.
+#if SOC_PM_SUPPORT_RTC_PERIPH_PD
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+#endif
+  for (int pin = 0; pin < 64; ++pin) {
+    if (((gpioMask >> pin) & 1) == 0) continue;
+    const auto g = static_cast<gpio_num_t>(pin);
+    if (wakeLow) {
+      rtc_gpio_pulldown_dis(g);
+      rtc_gpio_pullup_en(g);
+    } else {
+      rtc_gpio_pullup_dis(g);
+      rtc_gpio_pulldown_en(g);
+    }
+  }
 #elif SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
   // RISC-V (C3/C6/H2): the deep-sleep "gpio" wakeup source.
   esp_deep_sleep_enable_gpio_wakeup(gpioMask, wakeLow ? ESP_GPIO_WAKEUP_GPIO_LOW : ESP_GPIO_WAKEUP_GPIO_HIGH);
 #else
 #error "FreeInk PowerManager: target has no supported deep-sleep GPIO wakeup source"
 #endif
+}
+
+void PowerManager::setExtraWakePins(const uint64_t gpioMask) {
+  s_extraWakeMask = 0;
+  for (int pin = 0; pin < 64; ++pin) {
+    if ((gpioMask & (1ULL << pin)) == 0) continue;
+    if (!esp_sleep_is_valid_wakeup_gpio(static_cast<gpio_num_t>(pin))) continue;
+    s_extraWakeMask |= 1ULL << pin;
+  }
 }
 
 bool PowerManager::armPowerButtonWakeup() {
@@ -101,7 +134,16 @@ bool PowerManager::armPowerButtonWakeup() {
 
   // Hold the idle level with the opposite pull so the line is defined in sleep.
   pinMode(pin, activeHigh ? INPUT_PULLDOWN : INPUT_PULLUP);
-  armWakeOnPins(1ULL << pin, /*wakeLow=*/!activeHigh);
+  uint64_t mask = 1ULL << pin;
+  // The extras are active-low keys: they can only share an any-low trigger.
+  if (!activeHigh) {
+    for (int extra = 0; extra < 64; ++extra) {
+      if ((s_extraWakeMask & (1ULL << extra)) == 0) continue;
+      pinMode(extra, INPUT_PULLUP);
+      mask |= 1ULL << extra;
+    }
+  }
+  armWakeOnPins(mask, /*wakeLow=*/!activeHigh);
   return true;
 }
 
@@ -155,6 +197,13 @@ void holdRailOff(int8_t pin, uint8_t offLevel) {
 
 void PowerManager::powerDownRailsForSleep() {
   const auto& b = BoardConfig::ACTIVE;
+#if FREEINK_DEVICE_METALIO_EINK4
+  if (BoardConfig::isMetalioEInk4()) {
+    metalio::setAmplifier(false);
+    digitalWrite(metalio::VIBRATION_GPIO, LOW);
+    // Keep the shared display/SD rail up, as required by the vendor shutdown.
+  }
+#endif
 #if FREEINK_DEVICE_WS397
   // The EPD rail is an AXP2101 LDO, not a GPIO, so holdRailOff() below cannot
   // reach it — drop it here or the panel stays powered all through deep sleep.
